@@ -1,0 +1,1974 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import logging
+import os
+from pathlib import Path
+import re
+import threading
+from typing import Any
+
+import requests as http_requests
+
+import jieba
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, validator
+
+try:
+    import psycopg2
+    import psycopg2.extras
+    import psycopg2.pool
+except ImportError:
+    psycopg2 = None  # type: ignore[assignment]
+
+from data_platform.llm_client import ROOT_ENV_FILE, load_env_file_if_present
+from data_platform.product_query_assistant import ProductRecallQueryAssistant
+
+from data_platform.api.theme_api_auth import (
+    API_KEY_ENV_VAR,
+    APIKeyRecord,
+    get_active_key_count,
+    record_api_usage,
+    resolve_api_key,
+)
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_FEATURE_DIR = PROJECT_ROOT / "data_platform" / "storage" / "features" / "training_sets" / "week1_foundation"
+THEME_FEATURE_RETENTION_DAYS = max(30, int(os.environ.get("THEME_FEATURE_RETENTION_DAYS", "180")))
+THEME_FEATURE_SERVING_TABLES = {
+    "base": "serving.theme_base_daily",
+    "trends": "serving.theme_trends_daily",
+    "cross": "serving.theme_cross_daily",
+}
+API_KEY_HEADER_NAME = "X-API-Key"
+API_RESPONSE_SCHEMA = "xiamimate_theme_api_v1"
+PROTECTED_API_PREFIX = "/api/product-theme/"
+
+MARKETPLACE_TO_DOMAIN = {
+    "US": 1,
+    "UK": 2,
+    "DE": 3,
+    "FR": 4,
+    "JP": 5,
+    "CA": 6,
+    "IT": 8,
+    "ES": 9,
+    "IN": 10,
+    "MX": 11,
+    "BR": 12,
+    "AU": 13,
+}
+DOMAIN_TO_MARKETPLACE = {value: key for key, value in MARKETPLACE_TO_DOMAIN.items()}
+ASIN_PATTERN = re.compile(r"^[A-Z0-9]{8,16}$")
+ASCII_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
+MIN_TOKEN_LENGTH = 2
+
+QUERY_ALIAS_EXPANSIONS = {
+    "电子相框": ["digital photo frame", "digital picture frame", "wifi digital picture frame"],
+    "数码相框": ["digital photo frame", "digital picture frame", "wifi digital picture frame"],
+    "手持淋浴头": ["handheld shower head", "handheld showerhead", "high pressure handheld shower head"],
+    "手持花洒": ["handheld shower head", "handheld showerhead", "high pressure handheld shower head"],
+}
+
+TOKEN_ALIAS_EXPANSIONS = {
+    "电子": ["digital", "electronic"],
+    "数码": ["digital"],
+    "相框": ["photo frame", "picture frame"],
+    "画框": ["picture frame", "photo frame"],
+    "手持": ["handheld"],
+    "淋浴": ["shower"],
+    "淋浴头": ["shower head", "showerhead"],
+    "花洒": ["shower head", "showerhead"],
+}
+
+
+load_env_file_if_present(ROOT_ENV_FILE)
+QUERY_ASSISTANT = ProductRecallQueryAssistant(env_prefix="THEME_QUERY_NORMALIZER")
+
+
+class ResolveCandidatesRequest(BaseModel):
+    product_query: str = Field(..., min_length=1)
+    marketplace: str | int = "US"
+    query_aliases: list[str] = Field(default_factory=list)
+    category_hints: list[str] = Field(default_factory=list)
+    price_min: float | None = None
+    price_max: float | None = None
+    max_candidates: int = Field(default=50, ge=1, le=500)
+    active_only: bool = True
+
+    @validator("query_aliases", "category_hints", pre=True, always=True)
+    def _accept_csv_string(cls, v: Any) -> list[str]:  # noqa: N805
+        if isinstance(v, str):
+            return [s.strip() for s in v.split(",") if s.strip()]
+        if v is None:
+            return []
+        return v
+
+
+class CandidatePoolRequest(BaseModel):
+    candidate_asins: list[str] = Field(..., min_length=1)
+    marketplace: str | int = "US"
+    window_days: int = Field(default=30, ge=7, le=180)
+
+
+class WeakForecastRequest(CandidatePoolRequest):
+    top_n: int = Field(default=5, ge=1, le=20)
+
+
+class DrilldownRequest(CandidatePoolRequest):
+    top_n: int | None = Field(default=None, ge=1, le=20)
+
+
+class KeepaAsinLookupRequest(BaseModel):
+    asins: list[str] = Field(..., min_length=1)
+    marketplace: str | int = "US"
+
+    @validator("asins", pre=True, always=True)
+    def _accept_csv_string(cls, v: Any) -> list[str]:  # noqa: N805
+        if isinstance(v, str):
+            return [s.strip() for s in v.split(",") if s.strip()]
+        if v is None:
+            return []
+        return v
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _response_meta(endpoint: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    meta = {
+        "endpoint": endpoint,
+        "api_version": "2026-04-10",
+        "response_schema": API_RESPONSE_SCHEMA,
+        "generated_at": _utc_now_iso(),
+    }
+    if extra:
+        meta.update(extra)
+    return meta
+
+
+def _success_response(endpoint: str, data: dict[str, Any], message: str) -> dict[str, Any]:
+    return {
+        "success": True,
+        "code": "OK",
+        "message": message,
+        "data": data,
+        "meta": _response_meta(endpoint),
+    }
+
+
+def _error_response(endpoint: str, code: str, message: str) -> dict[str, Any]:
+    return {
+        "success": False,
+        "code": code,
+        "message": message,
+        "data": {},
+        "meta": _response_meta(endpoint),
+    }
+
+
+def _extract_bearer_token(authorization: str | None) -> str | None:
+    if not authorization:
+        return None
+    prefix = "bearer "
+    if authorization.lower().startswith(prefix):
+        return authorization[len(prefix):].strip()
+    return None
+
+
+def _auth_error_response(endpoint: str, status_code: int, code: str, message: str, meta: dict[str, Any] | None = None) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "success": False,
+            "code": code,
+            "message": message,
+            "data": {},
+            "meta": _response_meta(endpoint=endpoint, extra=meta),
+        },
+    )
+
+
+@dataclass
+class CandidateRecord:
+    asin: str
+    domain: int
+    marketplace: str
+    product_title: str
+    brand: str
+    category: str
+    category_path: str
+    search_term: str
+    business_priority: int
+    business_tier: str
+    is_active: bool
+    current_price: float | None
+    current_rating: float | None
+    current_review_count: int | None
+    current_bsr: int | None
+    current_offer_count: int | None
+    history_rows_30d: int
+    has_sales_signal_30d: bool
+    has_price_data_30d: bool
+    latest_history_date: str | None
+    keywords: list[str]
+
+
+def _normalize_marketplace(value: str | int) -> tuple[int, str]:
+    if isinstance(value, int):
+        if value not in DOMAIN_TO_MARKETPLACE:
+            raise HTTPException(status_code=400, detail=f"unsupported domain: {value}")
+        return value, DOMAIN_TO_MARKETPLACE[value]
+
+    text = str(value).strip().upper()
+    if text.isdigit():
+        domain = int(text)
+        if domain not in DOMAIN_TO_MARKETPLACE:
+            raise HTTPException(status_code=400, detail=f"unsupported domain: {domain}")
+        return domain, DOMAIN_TO_MARKETPLACE[domain]
+    if text not in MARKETPLACE_TO_DOMAIN:
+        raise HTTPException(status_code=400, detail=f"unsupported marketplace: {value}")
+    return MARKETPLACE_TO_DOMAIN[text], text
+
+
+def _normalize_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().lower())
+
+
+def _get_query_normalizer_config() -> dict[str, Any]:
+    config = QUERY_ASSISTANT.provider_summary()
+    return {
+        "active_profile": config.get("active_profile"),
+        "provider": config.get("provider"),
+        "enabled": config.get("enabled"),
+        "configured": config.get("configured"),
+        "base_url": config.get("base_url"),
+        "model": config.get("model"),
+        "timeout_seconds": config.get("timeout_seconds"),
+        "mode": config.get("mode"),
+        "error": config.get("error"),
+    }
+
+
+def _tokenize_phrase(value: str) -> list[str]:
+    text = value.strip()
+    if not text:
+        return []
+
+    tokens: list[str] = []
+    seen: set[str] = set()
+
+    for token in ASCII_TOKEN_PATTERN.findall(text.lower()):
+        if len(token) < MIN_TOKEN_LENGTH:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+
+    for token in jieba.lcut(text):
+        normalized = _normalize_text(token)
+        if not normalized:
+            continue
+        if ASCII_TOKEN_PATTERN.fullmatch(normalized):
+            continue
+        if len(normalized) < 2:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        tokens.append(normalized)
+
+    return tokens
+
+
+def _expand_query_aliases(phrase_inputs: list[str], tokens: list[str]) -> list[str]:
+    expansions: list[str] = []
+    seen: set[str] = set()
+
+    for phrase in phrase_inputs:
+        normalized_phrase = _normalize_text(phrase)
+        for expansion in QUERY_ALIAS_EXPANSIONS.get(normalized_phrase, []):
+            normalized_expansion = _normalize_text(expansion)
+            if not normalized_expansion or normalized_expansion in seen:
+                continue
+            seen.add(normalized_expansion)
+            expansions.append(expansion)
+
+    for token in tokens:
+        normalized_token = _normalize_text(token)
+        for expansion in TOKEN_ALIAS_EXPANSIONS.get(normalized_token, []):
+            normalized_expansion = _normalize_text(expansion)
+            if not normalized_expansion or normalized_expansion in seen:
+                continue
+            seen.add(normalized_expansion)
+            expansions.append(expansion)
+
+    return expansions
+
+
+def _unique_nonempty(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = value.strip()
+        if not normalized:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+def _sanitize_asins(asins: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    for asin in asins:
+        normalized = str(asin).strip().upper()
+        if not ASIN_PATTERN.fullmatch(normalized):
+            raise HTTPException(status_code=400, detail=f"invalid asin: {asin}")
+        cleaned.append(normalized)
+    unique: list[str] = []
+    seen: set[str] = set()
+    for asin in cleaned:
+        if asin in seen:
+            continue
+        seen.add(asin)
+        unique.append(asin)
+    return unique
+
+
+def _effective_feature_window_days(requested_days: int) -> int:
+    return min(requested_days, THEME_FEATURE_RETENTION_DAYS)
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL online serving pool — theme_api online reads should use PG only
+# ---------------------------------------------------------------------------
+
+_pg_pool_lock = threading.Lock()
+_pg_pool = None
+
+
+def _get_pg_connect_kwargs() -> dict[str, Any]:
+    return {
+        "host": os.environ.get("PG_HOST", "localhost"),
+        "port": int(os.environ.get("PG_PORT", "5432")),
+        "dbname": os.environ.get("PG_DB", "xiamimate"),
+        "user": os.environ.get("PG_USER", "xiamimate"),
+        "password": os.environ.get("PG_PASSWORD", "xiamimate"),
+    }
+
+
+def _get_pg_pool():
+    if psycopg2 is None:
+        raise HTTPException(
+            status_code=500,
+            detail="psycopg2 is required for PostgreSQL-backed theme_api serving",
+        )
+
+    global _pg_pool
+    if _pg_pool is not None:
+        return _pg_pool
+
+    with _pg_pool_lock:
+        if _pg_pool is not None:
+            return _pg_pool
+        minconn = max(1, int(os.environ.get("THEME_API_PG_POOL_MIN", "1")))
+        maxconn = max(minconn, int(os.environ.get("THEME_API_PG_POOL_MAX", "8")))
+        _pg_pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn,
+            maxconn,
+            **_get_pg_connect_kwargs(),
+        )
+        return _pg_pool
+
+
+@contextlib.contextmanager
+def _postgres_conn():
+    pool = _get_pg_pool()
+    conn = pool.getconn()
+    try:
+        conn.autocommit = True
+        yield conn
+    finally:
+        pool.putconn(conn)
+
+
+def _run_pg_dict_query(conn, sql: str, params: list[Any] | None = None) -> list[dict[str, Any]]:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+        cursor.execute(sql, params or [])
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def _get_theme_feature_serving_status(include_data_max_date: bool = True) -> dict[str, Any]:
+    with _postgres_conn() as conn:
+        registry_row = _run_pg_dict_query(
+            conn,
+            """
+            SELECT
+                to_regclass(%s) AS base_table,
+                to_regclass(%s) AS trends_table,
+                to_regclass(%s) AS cross_table
+            """,
+            [
+                THEME_FEATURE_SERVING_TABLES["base"],
+                THEME_FEATURE_SERVING_TABLES["trends"],
+                THEME_FEATURE_SERVING_TABLES["cross"],
+            ],
+        )[0]
+
+        missing_tables = [
+            THEME_FEATURE_SERVING_TABLES[table_name]
+            for table_name, registry_key in (
+                ("base", "base_table"),
+                ("trends", "trends_table"),
+                ("cross", "cross_table"),
+            )
+            if registry_row.get(registry_key) is None
+        ]
+        if missing_tables:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "theme feature serving tables missing: "
+                    f"{', '.join(missing_tables)}. "
+                    "sync week1 foundation features into PostgreSQL before using the API."
+                ),
+            )
+
+        max_date_row = {
+            "base_max_date": None,
+            "trends_max_date": None,
+            "cross_max_date": None,
+        }
+        if include_data_max_date:
+            max_date_row = _run_pg_dict_query(
+                conn,
+                """
+                SELECT
+                    (SELECT MAX(date) FROM serving.theme_base_daily) AS base_max_date,
+                    (SELECT MAX(date) FROM serving.theme_trends_daily) AS trends_max_date,
+                    (SELECT MAX(date) FROM serving.theme_cross_daily) AS cross_max_date
+                """,
+            )[0]
+
+    max_dates = [value for value in max_date_row.values() if value is not None]
+    return {
+        "schema": "serving",
+        "retention_days": THEME_FEATURE_RETENTION_DAYS,
+        "data_max_date": max(max_dates).isoformat() if max_dates else None,
+        "tables": {
+            "theme_base_daily": {
+                "name": THEME_FEATURE_SERVING_TABLES["base"],
+                "data_max_date": max_date_row["base_max_date"].isoformat() if max_date_row.get("base_max_date") else None,
+            },
+            "theme_trends_daily": {
+                "name": THEME_FEATURE_SERVING_TABLES["trends"],
+                "data_max_date": max_date_row["trends_max_date"].isoformat() if max_date_row.get("trends_max_date") else None,
+            },
+            "theme_cross_daily": {
+                "name": THEME_FEATURE_SERVING_TABLES["cross"],
+                "data_max_date": max_date_row["cross_max_date"].isoformat() if max_date_row.get("cross_max_date") else None,
+            },
+        },
+    }
+
+
+def _build_query_variants(product_query: str, query_aliases: list[str], category_hints: list[str]) -> tuple[list[str], list[str], list[str]]:
+    phrase_inputs = _unique_nonempty([product_query] + query_aliases + category_hints)
+    tokens: list[str] = []
+    for phrase in phrase_inputs:
+        tokens.extend(_tokenize_phrase(phrase))
+    unique_tokens = _unique_nonempty(tokens)
+    expansions = _expand_query_aliases(phrase_inputs, unique_tokens)
+    all_phrase_inputs = _unique_nonempty(phrase_inputs + expansions)
+    normalized_phrases = [_normalize_text(value) for value in all_phrase_inputs if _normalize_text(value)]
+    expanded_tokens: list[str] = []
+    for phrase in all_phrase_inputs:
+        expanded_tokens.extend(_tokenize_phrase(phrase))
+    return normalized_phrases, _unique_nonempty(expanded_tokens), expansions
+
+
+def _match_list_contains(values: list[str], needle: str) -> bool:
+    return any(needle in _normalize_text(value) for value in values if value)
+
+
+def _text_contains_token(text: str, token: str) -> bool:
+    if not text or not token:
+        return False
+    if ASCII_TOKEN_PATTERN.fullmatch(token):
+        return re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", text) is not None
+    return token in text
+
+
+def _score_candidate(
+    record: CandidateRecord,
+    normalized_phrases: list[str],
+    tokens: list[str],
+) -> tuple[float, list[str], dict[str, float]]:
+    title = _normalize_text(record.product_title)
+    category = _normalize_text(record.category)
+    category_path = _normalize_text(record.category_path)
+    search_term = _normalize_text(record.search_term)
+    keywords = [_normalize_text(keyword) for keyword in record.keywords if keyword]
+
+    phrase_score = 0.0
+    token_score = 0.0
+    reasons: set[str] = set()
+
+    for phrase in normalized_phrases:
+        if phrase and phrase in title:
+            phrase_score += 80
+            reasons.add("title_phrase_match")
+        if phrase and phrase in category:
+            phrase_score += 50
+            reasons.add("category_phrase_match")
+        if phrase and phrase in category_path:
+            phrase_score += 45
+            reasons.add("category_path_phrase_match")
+        if phrase and phrase in search_term:
+            phrase_score += 35
+            reasons.add("search_term_phrase_match")
+        if phrase and _match_list_contains(keywords, phrase):
+            phrase_score += 42
+            reasons.add("keyword_phrase_match")
+
+    combined_text = " ".join([title, category, category_path, search_term] + keywords)
+    matched_tokens = 0
+    for token in tokens:
+        token_hit = False
+        if _text_contains_token(title, token):
+            token_score += 14
+            reasons.add("title_token_match")
+            token_hit = True
+        if _text_contains_token(category, token):
+            token_score += 10
+            reasons.add("category_token_match")
+            token_hit = True
+        if _text_contains_token(category_path, token):
+            token_score += 8
+            reasons.add("category_path_token_match")
+            token_hit = True
+        if _text_contains_token(search_term, token):
+            token_score += 7
+            reasons.add("search_term_token_match")
+            token_hit = True
+        if any(_text_contains_token(keyword, token) for keyword in keywords):
+            token_score += 12
+            reasons.add("keyword_token_match")
+            token_hit = True
+        if token_hit:
+            matched_tokens += 1
+
+    if tokens and matched_tokens == len(tokens):
+        token_score += 18
+        reasons.add("all_tokens_covered")
+    elif matched_tokens >= 2:
+        token_score += 8
+        reasons.add("multi_token_covered")
+
+    business_score = min(max(record.business_priority, 0), 100) / 10.0
+    freshness_score = 12.0 if record.has_sales_signal_30d else 0.0
+    completeness_score = 8.0 if record.has_price_data_30d else 0.0
+
+    total_score = phrase_score + token_score + business_score + freshness_score + completeness_score
+    minimum_token_hits = 1 if len(tokens) <= 1 else min(2, len(tokens))
+    has_phrase_match = phrase_score > 0
+    if tokens and not has_phrase_match and matched_tokens < minimum_token_hits:
+        total_score = 0.0
+    if not normalized_phrases and not tokens:
+        total_score = 0.0
+    if combined_text == "":
+        total_score = 0.0
+
+    breakdown = {
+        "phrase_score": round(phrase_score, 2),
+        "token_score": round(token_score, 2),
+        "business_score": round(business_score, 2),
+        "freshness_score": round(freshness_score, 2),
+        "completeness_score": round(completeness_score, 2),
+    }
+    return total_score, sorted(reasons), breakdown
+
+
+def _keepa_latest_value(csv_2d: list, index: int) -> float | int | None:
+    if not csv_2d or index >= len(csv_2d):
+        return None
+    arr = csv_2d[index]
+    if not arr or len(arr) < 2:
+        return None
+    raw = arr[-1]
+    if raw is None or raw == -1:
+        return None
+    return raw
+
+
+def _keepa_latest_price(csv_2d: list, index: int, is_yen: bool) -> float | None:
+    val = _keepa_latest_value(csv_2d, index)
+    if val is None:
+        return None
+    if is_yen:
+        return round(float(val), 2)
+    return round(float(val) / 100, 2)
+
+
+def _keepa_stats_value(stats_arr: list, index: int) -> float | int | None:
+    if not stats_arr or index >= len(stats_arr):
+        return None
+    raw = stats_arr[index]
+    if raw is None or raw == -1:
+        return None
+    return raw
+
+
+def _keepa_stats_price(stats: dict, key: str, index: int, is_yen: bool) -> float | None:
+    arr = stats.get(key) or []
+    val = _keepa_stats_value(arr, index)
+    if val is None:
+        return None
+    if is_yen:
+        return round(float(val), 2)
+    return round(float(val) / 100, 2)
+
+
+class ProductThemeService:
+    def _fetch_domain_candidates(self, domain: int) -> list[dict[str, Any]]:
+        """Fetch all registry rows for a domain from PostgreSQL serving tables."""
+        with _postgres_conn() as conn:
+            return _run_pg_dict_query(
+                conn,
+                """
+                WITH history_flags AS (
+                    SELECT
+                        asin,
+                        domain,
+                        MAX(date) AS latest_history_date,
+                        COUNT(*) FILTER (WHERE date >= CURRENT_DATE - INTERVAL '30 days') AS history_rows_30d,
+                        MAX(CASE WHEN date >= CURRENT_DATE - INTERVAL '30 days' AND (monthly_sold IS NOT NULL OR bsr IS NOT NULL) THEN 1 ELSE 0 END) AS has_sales_signal_30d,
+                        MAX(CASE WHEN date >= CURRENT_DATE - INTERVAL '30 days' AND (
+                            amazon_price IS NOT NULL OR new_price IS NOT NULL OR buy_box_price IS NOT NULL OR list_price IS NOT NULL
+                        ) THEN 1 ELSE 0 END) AS has_price_data_30d
+                    FROM sync.keepa_product_history
+                    WHERE domain = %s
+                    GROUP BY 1, 2
+                ),
+                keyword_agg AS (
+                    SELECT asin, domain, ARRAY_AGG(DISTINCT keyword ORDER BY keyword) AS keywords
+                    FROM sync.asin_keyword_mapping
+                    WHERE domain = %s
+                    GROUP BY 1, 2
+                )
+                SELECT
+                    r.asin,
+                    r.domain,
+                    COALESCE(r.marketplace, '') AS marketplace,
+                    COALESCE(r.product_title, '') AS product_title,
+                    COALESCE(r.brand, '') AS brand,
+                    COALESCE(r.category, '') AS category,
+                    COALESCE(r.category_path, '') AS category_path,
+                    COALESCE(r.search_term, '') AS search_term,
+                    COALESCE(r.business_priority, r.priority, 0) AS business_priority,
+                    COALESCE(r.business_tier, '') AS business_tier,
+                    COALESCE(r.is_active, TRUE) AS is_active,
+                    s.price AS current_price,
+                    s.rating AS current_rating,
+                    s.review_count AS current_review_count,
+                    s.bsr AS current_bsr,
+                    COALESCE(s.total_offer_count, s.seller_count, s.retrieved_offer_count) AS current_offer_count,
+                    COALESCE(h.history_rows_30d, 0) AS history_rows_30d,
+                    COALESCE(h.has_sales_signal_30d, 0) AS has_sales_signal_30d,
+                    COALESCE(h.has_price_data_30d, 0) AS has_price_data_30d,
+                    h.latest_history_date,
+                    COALESCE(k.keywords, ARRAY[]::VARCHAR[]) AS keywords
+                FROM sync.keepa_asin_registry r
+                LEFT JOIN sync.keepa_product_snapshot s
+                    ON r.asin = s.asin AND r.domain = s.domain
+                LEFT JOIN history_flags h
+                    ON r.asin = h.asin AND r.domain = h.domain
+                LEFT JOIN keyword_agg k
+                    ON r.asin = k.asin AND r.domain = k.domain
+                WHERE r.domain = %s
+                """,
+                [domain, domain, domain],
+            )
+
+    async def resolve_candidates(self, request: ResolveCandidatesRequest) -> dict[str, Any]:
+        domain, marketplace = _normalize_marketplace(request.marketplace)
+
+        # LLM normalization (network I/O) and PG fetch (DB I/O) run in parallel
+        normalization, rows = await asyncio.gather(
+            asyncio.to_thread(
+                QUERY_ASSISTANT.normalize,
+                product_query=request.product_query,
+                query_aliases=request.query_aliases,
+                category_hints=request.category_hints,
+                marketplace=marketplace,
+            ),
+            asyncio.to_thread(self._fetch_domain_candidates, domain),
+        )
+
+        normalized_phrases, tokens, query_expansions = _build_query_variants(
+            normalization.product_query,
+            normalization.query_aliases,
+            normalization.category_hints,
+        )
+
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            record = CandidateRecord(
+                asin=str(row["asin"]),
+                domain=int(row["domain"]),
+                marketplace=str(row["marketplace"] or marketplace),
+                product_title=str(row["product_title"] or ""),
+                brand=str(row["brand"] or ""),
+                category=str(row["category"] or ""),
+                category_path=str(row["category_path"] or ""),
+                search_term=str(row["search_term"] or ""),
+                business_priority=int(row["business_priority"] or 0),
+                business_tier=str(row["business_tier"] or ""),
+                is_active=bool(row["is_active"]),
+                current_price=float(row["current_price"]) if row["current_price"] is not None else None,
+                current_rating=float(row["current_rating"]) if row["current_rating"] is not None else None,
+                current_review_count=int(row["current_review_count"]) if row["current_review_count"] is not None else None,
+                current_bsr=int(row["current_bsr"]) if row["current_bsr"] is not None else None,
+                current_offer_count=int(row["current_offer_count"]) if row["current_offer_count"] is not None else None,
+                history_rows_30d=int(row["history_rows_30d"] or 0),
+                has_sales_signal_30d=bool(row["has_sales_signal_30d"]),
+                has_price_data_30d=bool(row["has_price_data_30d"]),
+                latest_history_date=str(row["latest_history_date"] or "") or None,
+                keywords=list(row["keywords"] or []),
+            )
+            if request.active_only and not record.is_active:
+                continue
+            if request.price_min is not None and record.current_price is not None and record.current_price < request.price_min:
+                continue
+            if request.price_max is not None and record.current_price is not None and record.current_price > request.price_max:
+                continue
+
+            score, reasons, breakdown = _score_candidate(record, normalized_phrases, tokens)
+            if score <= 0:
+                continue
+            candidates.append(
+                {
+                    "asin": record.asin,
+                    "domain": record.domain,
+                    "marketplace": marketplace,
+                    "product_title": record.product_title,
+                    "brand": record.brand,
+                    "category": record.category,
+                    "category_path": record.category_path,
+                    "search_term": record.search_term,
+                    "keywords": record.keywords,
+                    "business_priority": record.business_priority,
+                    "business_tier": record.business_tier,
+                    "current_price": record.current_price,
+                    "current_rating": record.current_rating,
+                    "current_review_count": record.current_review_count,
+                    "current_bsr": record.current_bsr,
+                    "current_offer_count": record.current_offer_count,
+                    "history_rows_30d": record.history_rows_30d,
+                    "has_sales_signal_30d": record.has_sales_signal_30d,
+                    "has_price_data_30d": record.has_price_data_30d,
+                    "latest_history_date": record.latest_history_date,
+                    "match_score": round(score, 2),
+                    "match_reasons": reasons,
+                    "match_breakdown": breakdown,
+                }
+            )
+
+        candidates.sort(
+            key=lambda item: (
+                item["match_score"],
+                item["business_priority"],
+                1 if item["has_sales_signal_30d"] else 0,
+                item["current_review_count"] or 0,
+            ),
+            reverse=True,
+        )
+        truncated = len(candidates) > request.max_candidates
+        candidate_items = candidates[: request.max_candidates]
+        theme_extraction = normalization.theme_extraction
+        recall_normalization = normalization.recall_normalization
+
+        return {
+            "marketplace": marketplace,
+            "domain": domain,
+            "raw_product_query": request.product_query,
+            "normalized_query": normalized_phrases[0] if normalized_phrases else _normalize_text(normalization.product_query),
+            "query_phrases": normalized_phrases,
+            "query_tokens": tokens,
+            "query_expansions": query_expansions,
+            "query_normalization": {
+                "mode": normalization.normalization_mode,
+                "llm_used": normalization.llm_used,
+                "pipeline_mode": normalization.pipeline_mode,
+                "pipeline_llm_used": bool(
+                    (theme_extraction.llm_used if theme_extraction is not None else False)
+                    or (recall_normalization.llm_used if recall_normalization is not None else False)
+                ),
+                "llm_provider": normalization.llm_provider,
+                "llm_model": normalization.llm_model,
+                "llm_language": normalization.llm_language,
+                "llm_confidence": normalization.llm_confidence,
+                "llm_error": normalization.llm_error,
+                "normalized_product_query": normalization.product_query,
+                "normalized_query_aliases": normalization.query_aliases,
+                "normalized_category_hints": normalization.category_hints,
+                "theme_extraction": {
+                    "mode": theme_extraction.extraction_mode if theme_extraction is not None else None,
+                    "llm_used": theme_extraction.llm_used if theme_extraction is not None else False,
+                    "llm_provider": theme_extraction.llm_provider if theme_extraction is not None else None,
+                    "llm_model": theme_extraction.llm_model if theme_extraction is not None else None,
+                    "llm_language": theme_extraction.llm_language if theme_extraction is not None else None,
+                    "llm_confidence": theme_extraction.llm_confidence if theme_extraction is not None else None,
+                    "llm_error": theme_extraction.llm_error if theme_extraction is not None else None,
+                    "extracted_theme": theme_extraction.extracted_theme if theme_extraction is not None else None,
+                    "extracted_query_aliases": theme_extraction.query_aliases if theme_extraction is not None else [],
+                    "extracted_category_hints": theme_extraction.category_hints if theme_extraction is not None else [],
+                },
+                "recall_normalization": {
+                    "mode": recall_normalization.normalization_mode if recall_normalization is not None else None,
+                    "llm_used": recall_normalization.llm_used if recall_normalization is not None else False,
+                    "llm_provider": recall_normalization.llm_provider if recall_normalization is not None else None,
+                    "llm_model": recall_normalization.llm_model if recall_normalization is not None else None,
+                    "llm_language": recall_normalization.llm_language if recall_normalization is not None else None,
+                    "llm_confidence": recall_normalization.llm_confidence if recall_normalization is not None else None,
+                    "llm_error": recall_normalization.llm_error if recall_normalization is not None else None,
+                    "normalized_product_query": (
+                        recall_normalization.normalized_product_query if recall_normalization is not None else None
+                    ),
+                    "normalized_query_aliases": recall_normalization.query_aliases if recall_normalization is not None else [],
+                    "normalized_category_hints": (
+                        recall_normalization.category_hints if recall_normalization is not None else []
+                    ),
+                },
+            },
+            "candidate_count": len(candidate_items),
+            "candidate_total_before_truncate": len(candidates),
+            "truncated": truncated,
+            "matched_categories": _unique_nonempty([item["category"] for item in candidate_items])[:10],
+            "matched_keywords": _unique_nonempty([keyword for item in candidate_items for keyword in item["keywords"]])[:20],
+            "candidate_asins": [item["asin"] for item in candidate_items],
+            "candidate_items": candidate_items,
+            "recall_notes": [
+                "when configured, recall preparation now runs as two internal stages: theme extraction first, then recall normalization",
+                "the external resolve_candidates tool surface stays merged; only the internal service layer is split into extraction and normalization",
+                "candidate pool is resolved by multi-field recall over title/category/category_path/search_term/keyword",
+                "built-in Chinese-to-English query expansion remains as a fallback bridge for common product terms when source data is English-dominant",
+                "business_priority and recent data completeness are used as ranking boosters, not hard filters",
+            ],
+        }
+
+    def get_candidate_pool_stats(self, request: CandidatePoolRequest) -> dict[str, Any]:
+        domain, marketplace = _normalize_marketplace(request.marketplace)
+        candidate_asins = _sanitize_asins(request.candidate_asins)
+        effective_window_days = _effective_feature_window_days(request.window_days)
+
+        with _postgres_conn() as conn:
+            combined_rows = _run_pg_dict_query(
+                conn,
+                """
+            WITH max_date AS (
+                SELECT MAX(date) AS max_date
+                FROM serving.theme_base_daily
+                WHERE domain = %s
+            ),
+            filtered AS (
+                SELECT *
+                FROM serving.theme_base_daily
+                WHERE domain = %s
+                  AND asin = ANY(%s)
+                  AND date >= (
+                      SELECT max_date - (%s * INTERVAL '1 day')
+                      FROM max_date
+                  )
+            ),
+            latest_ranked AS (
+                SELECT
+                    asin,
+                    domain,
+                    product_title,
+                    brand,
+                    category,
+                    effective_price,
+                    rating,
+                    review_count,
+                    COALESCE(new_offer_count, 0) + COALESCE(used_offer_count, 0) AS offer_count,
+                    bsr,
+                    ROW_NUMBER() OVER (PARTITION BY asin, domain ORDER BY date DESC) AS rn
+                FROM filtered
+            ),
+            latest AS (
+                SELECT
+                    asin,
+                    domain,
+                    product_title,
+                    brand,
+                    category,
+                    effective_price,
+                    rating,
+                    review_count,
+                    offer_count,
+                    bsr
+                FROM latest_ranked
+                WHERE rn = 1
+            ),
+            asin_window AS (
+                SELECT
+                    asin,
+                    domain,
+                    SUM(COALESCE(estimated_daily_sales, 0)) AS sales_window_sum,
+                    AVG(estimated_daily_sales) AS sales_daily_avg,
+                    AVG(rating) AS rating_avg_window,
+                    MAX(review_count) - MIN(review_count) AS review_growth_window,
+                    AVG(COALESCE(new_offer_count, 0) + COALESCE(used_offer_count, 0)) AS offer_count_avg_window
+                FROM filtered
+                GROUP BY 1, 2
+            ),
+            combined AS (
+                SELECT
+                    aw.*,
+                    l.product_title,
+                    l.brand,
+                    l.category,
+                    l.effective_price AS latest_effective_price,
+                    l.rating AS latest_rating,
+                    l.review_count AS latest_review_count,
+                    l.offer_count AS latest_offer_count,
+                    l.bsr AS latest_bsr
+                FROM asin_window aw
+                LEFT JOIN latest l USING (asin, domain)
+            )
+            SELECT
+                COUNT(*) AS candidate_count,
+                SUM(sales_window_sum) AS sales_window_sum,
+                AVG(sales_window_sum) AS sales_window_avg,
+                PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY sales_window_sum) AS sales_window_median,
+                PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY latest_effective_price) AS price_p25,
+                PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY latest_effective_price) AS price_p50,
+                PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY latest_effective_price) AS price_p75,
+                AVG(latest_rating) AS rating_avg,
+                PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY latest_rating) AS rating_median,
+                PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY latest_review_count) AS review_count_median,
+                PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY latest_offer_count) AS offer_count_median,
+                AVG(review_growth_window) AS review_growth_avg,
+                (SELECT max_date FROM max_date) AS max_date
+            FROM combined
+                """,
+                [domain, domain, candidate_asins, effective_window_days - 1],
+            )
+            top_brand_rows = _run_pg_dict_query(
+                conn,
+                """
+            WITH max_date AS (
+                SELECT MAX(date) AS max_date
+                FROM serving.theme_base_daily
+                WHERE domain = %s
+            ),
+            latest_ranked AS (
+                SELECT
+                    asin,
+                    brand,
+                    category,
+                    ROW_NUMBER() OVER (PARTITION BY asin, domain ORDER BY date DESC) AS rn
+                FROM serving.theme_base_daily
+                WHERE domain = %s
+                  AND asin = ANY(%s)
+                  AND date >= (
+                      SELECT max_date - (%s * INTERVAL '1 day')
+                      FROM max_date
+                  )
+            ),
+            latest AS (
+                SELECT asin, brand, category
+                FROM latest_ranked
+                WHERE rn = 1
+            ),
+            brand_agg AS (
+                SELECT COALESCE(brand, 'UNKNOWN') AS name, COUNT(*) AS count
+                FROM latest
+                GROUP BY 1
+                ORDER BY count DESC, name ASC
+                LIMIT 10
+            ),
+            category_agg AS (
+                SELECT COALESCE(category, 'UNKNOWN') AS name, COUNT(*) AS count
+                FROM latest
+                GROUP BY 1
+                ORDER BY count DESC, name ASC
+                LIMIT 10
+            )
+            SELECT 'brand' AS agg_type, name, count FROM brand_agg
+            UNION ALL
+            SELECT 'category' AS agg_type, name, count FROM category_agg
+                """,
+                [domain, domain, candidate_asins, effective_window_days - 1],
+            )
+
+        top_brand_list = [{"name": r["name"], "count": r["count"]} for r in top_brand_rows if r["agg_type"] == "brand"]
+        top_category_list = [{"name": r["name"], "count": r["count"]} for r in top_brand_rows if r["agg_type"] == "category"]
+
+        stats = combined_rows[0] if combined_rows else {}
+        tier_distribution = self._fetch_business_tier_distribution(domain, candidate_asins)
+
+        return {
+            "marketplace": marketplace,
+            "domain": domain,
+            "window_days": effective_window_days,
+            "candidate_count": int(stats.get("candidate_count") or 0),
+            "sales_window_sum": round(float(stats.get("sales_window_sum") or 0.0), 2),
+            "sales_window_avg": round(float(stats.get("sales_window_avg") or 0.0), 2),
+            "sales_window_median": round(float(stats.get("sales_window_median") or 0.0), 2),
+            "price_distribution": {
+                "p25": round(float(stats.get("price_p25") or 0.0), 2) if stats.get("price_p25") is not None else None,
+                "p50": round(float(stats.get("price_p50") or 0.0), 2) if stats.get("price_p50") is not None else None,
+                "p75": round(float(stats.get("price_p75") or 0.0), 2) if stats.get("price_p75") is not None else None,
+            },
+            "rating_distribution": {
+                "avg": round(float(stats.get("rating_avg") or 0.0), 2) if stats.get("rating_avg") is not None else None,
+                "median": round(float(stats.get("rating_median") or 0.0), 2) if stats.get("rating_median") is not None else None,
+            },
+            "review_count_median": int(stats.get("review_count_median") or 0),
+            "offer_count_median": round(float(stats.get("offer_count_median") or 0.0), 2),
+            "review_growth_avg": round(float(stats.get("review_growth_avg") or 0.0), 2),
+            "business_tier_distribution": tier_distribution,
+            "top_brands": top_brand_list,
+            "top_categories": top_category_list,
+            "data_max_date": stats.get("max_date"),
+        }
+
+    def get_candidate_pool_trends(self, request: CandidatePoolRequest) -> dict[str, Any]:
+        domain, marketplace = _normalize_marketplace(request.marketplace)
+        candidate_asins = _sanitize_asins(request.candidate_asins)
+        effective_window_days = _effective_feature_window_days(request.window_days)
+
+        with _postgres_conn() as conn:
+            rows = _run_pg_dict_query(
+                conn,
+                """
+            WITH max_date AS (
+                SELECT MAX(date) AS max_date
+                FROM serving.theme_trends_daily
+                WHERE domain = %s
+            ),
+            filtered AS (
+                SELECT *
+                FROM serving.theme_trends_daily
+                WHERE domain = %s
+                  AND asin = ANY(%s)
+                  AND date >= (
+                      SELECT max_date - (%s * INTERVAL '1 day')
+                      FROM max_date
+                  )
+            )
+            SELECT
+                COUNT(*) AS row_count,
+                COUNT(*) FILTER (WHERE trend_index_mean IS NOT NULL) AS trend_rows,
+                AVG(trend_index_mean) FILTER (WHERE date >= (SELECT max_date - INTERVAL '6 day' FROM max_date)) AS trend_7d_mean,
+                AVG(trend_index_mean) AS trend_30d_mean,
+                AVG(trend_index_wow) FILTER (WHERE date >= (SELECT max_date - INTERVAL '6 day' FROM max_date)) AS trend_wow,
+                AVG(trend_index_dod) FILTER (WHERE date >= (SELECT max_date - INTERVAL '2 day' FROM max_date)) AS trend_dod,
+                AVG(trend_index_roll_std_7) AS trend_volatility,
+                MAX(trend_index_roll_max_7) AS trend_peak_recent,
+                AVG(trend_keyword_coverage_ratio) AS keyword_coverage_ratio,
+                (SELECT max_date FROM max_date) AS max_date
+            FROM filtered
+                """,
+                [domain, domain, candidate_asins, effective_window_days - 1],
+            )
+
+        stats = rows[0] if rows else {}
+        trend_rows = int(stats.get("trend_rows") or 0)
+        row_count = int(stats.get("row_count") or 0)
+        coverage = round(trend_rows / row_count, 4) if row_count else 0.0
+        trend_wow = float(stats.get("trend_wow") or 0.0)
+        trend_volatility = float(stats.get("trend_volatility") or 0.0)
+
+        if coverage == 0:
+            trend_stage = "no_signal"
+        elif trend_wow >= 3:
+            trend_stage = "rising"
+        elif trend_wow <= -3:
+            trend_stage = "cooling"
+        elif trend_volatility >= 8:
+            trend_stage = "volatile"
+        else:
+            trend_stage = "flat"
+
+        return {
+            "marketplace": marketplace,
+            "domain": domain,
+            "window_days": effective_window_days,
+            "trend_7d_mean": round(float(stats.get("trend_7d_mean") or 0.0), 2) if stats.get("trend_7d_mean") is not None else None,
+            "trend_30d_mean": round(float(stats.get("trend_30d_mean") or 0.0), 2) if stats.get("trend_30d_mean") is not None else None,
+            "trend_wow": round(trend_wow, 2),
+            "trend_dod": round(float(stats.get("trend_dod") or 0.0), 2),
+            "trend_volatility": round(trend_volatility, 2),
+            "trend_peak_recent": round(float(stats.get("trend_peak_recent") or 0.0), 2) if stats.get("trend_peak_recent") is not None else None,
+            "keyword_coverage_ratio": round(float(stats.get("keyword_coverage_ratio") or 0.0), 4) if stats.get("keyword_coverage_ratio") is not None else None,
+            "trend_data_coverage": coverage,
+            "trend_stage": trend_stage,
+            "data_max_date": stats.get("max_date"),
+        }
+
+    def get_candidate_pool_weak_forecast(self, request: WeakForecastRequest) -> dict[str, Any]:
+        domain, marketplace = _normalize_marketplace(request.marketplace)
+        candidate_asins = _sanitize_asins(request.candidate_asins)
+        effective_window_days = max(30, _effective_feature_window_days(request.window_days))
+
+        with _postgres_conn() as conn:
+            rows = _run_pg_dict_query(
+                conn,
+                """
+            WITH max_date AS (
+                SELECT MAX(date) AS max_date
+                FROM serving.theme_cross_daily
+                WHERE domain = %s
+            ),
+            filtered AS (
+                SELECT *
+                FROM serving.theme_cross_daily
+                WHERE domain = %s
+                  AND asin = ANY(%s)
+                  AND date >= (
+                      SELECT max_date - (%s * INTERVAL '1 day')
+                      FROM max_date
+                  )
+            ),
+            latest_ranked AS (
+                SELECT
+                    asin,
+                    domain,
+                    product_title,
+                    effective_price,
+                    bsr,
+                    rating,
+                    review_count,
+                    COALESCE(new_offer_count, 0) + COALESCE(used_offer_count, 0) AS offer_count,
+                    ROW_NUMBER() OVER (PARTITION BY asin, domain ORDER BY date DESC) AS rn
+                FROM filtered
+            ),
+            latest AS (
+                SELECT
+                    asin,
+                    domain,
+                    product_title,
+                    effective_price,
+                    bsr,
+                    rating,
+                    review_count,
+                    offer_count
+                FROM latest_ranked
+                WHERE rn = 1
+            ),
+            signal AS (
+                SELECT
+                    asin,
+                    domain,
+                    AVG(estimated_daily_sales) FILTER (WHERE date >= (SELECT max_date - INTERVAL '6 day' FROM max_date)) AS sales_mean_7,
+                    AVG(estimated_daily_sales) FILTER (WHERE date < (SELECT max_date - INTERVAL '6 day' FROM max_date)) AS sales_mean_prev,
+                    AVG(trend_index_mean) FILTER (WHERE date >= (SELECT max_date - INTERVAL '6 day' FROM max_date)) AS trend_mean_7,
+                    AVG(trend_index_mean) FILTER (WHERE date < (SELECT max_date - INTERVAL '6 day' FROM max_date)) AS trend_mean_prev,
+                    AVG(bsr) FILTER (WHERE date >= (SELECT max_date - INTERVAL '6 day' FROM max_date)) AS bsr_mean_7,
+                    AVG(bsr) FILTER (WHERE date < (SELECT max_date - INTERVAL '6 day' FROM max_date)) AS bsr_mean_prev,
+                    MAX(review_count) - MIN(review_count) AS review_growth_30,
+                    AVG(price_discount_pct) AS avg_discount_pct
+                FROM filtered
+                GROUP BY 1, 2
+            )
+            SELECT
+                l.asin,
+                l.domain,
+                l.product_title,
+                l.effective_price,
+                l.bsr,
+                l.rating,
+                l.review_count,
+                l.offer_count,
+                s.sales_mean_7,
+                s.sales_mean_prev,
+                s.trend_mean_7,
+                s.trend_mean_prev,
+                s.bsr_mean_7,
+                s.bsr_mean_prev,
+                s.review_growth_30,
+                s.avg_discount_pct
+            FROM latest l
+            LEFT JOIN signal s USING (asin, domain)
+                """,
+                [domain, domain, candidate_asins, effective_window_days - 1],
+            )
+
+        predictions: list[dict[str, Any]] = []
+        for row in rows:
+            sales_mean_7 = float(row.get("sales_mean_7") or 0.0)
+            sales_mean_prev = float(row.get("sales_mean_prev") or 0.0)
+            trend_mean_7 = float(row.get("trend_mean_7") or 0.0)
+            trend_mean_prev = float(row.get("trend_mean_prev") or 0.0)
+            bsr_mean_7 = float(row.get("bsr_mean_7") or 0.0)
+            bsr_mean_prev = float(row.get("bsr_mean_prev") or 0.0)
+            review_growth_30 = float(row.get("review_growth_30") or 0.0)
+            offer_count = float(row.get("offer_count") or 0.0)
+
+            sales_momentum = ((sales_mean_7 - sales_mean_prev) / sales_mean_prev * 100.0) if sales_mean_prev > 0 else 0.0
+            trend_momentum = ((trend_mean_7 - trend_mean_prev) / trend_mean_prev * 100.0) if trend_mean_prev > 0 else 0.0
+            bsr_improvement = ((bsr_mean_prev - bsr_mean_7) / bsr_mean_prev * 100.0) if bsr_mean_prev > 0 else 0.0
+
+            heuristic_score = (
+                min(max(sales_momentum, -100.0), 100.0) * 0.35
+                + min(max(trend_momentum, -100.0), 100.0) * 0.25
+                + min(max(bsr_improvement, -100.0), 100.0) * 0.20
+                + min(max(review_growth_30, 0.0), 200.0) * 0.05
+                - min(offer_count, 50.0) * 0.5
+            )
+            reasons: list[str] = []
+            if sales_momentum > 5:
+                reasons.append("sales_momentum_positive")
+            if trend_momentum > 3:
+                reasons.append("trend_momentum_positive")
+            if bsr_improvement > 3:
+                reasons.append("bsr_improving")
+            if review_growth_30 > 0:
+                reasons.append("review_growth_positive")
+            if offer_count > 20:
+                reasons.append("competition_high")
+
+            predictions.append(
+                {
+                    "asin": row["asin"],
+                    "product_title": row.get("product_title"),
+                    "heuristic_score": round(heuristic_score, 2),
+                    "sales_momentum_pct": round(sales_momentum, 2),
+                    "trend_momentum_pct": round(trend_momentum, 2),
+                    "bsr_improvement_pct": round(bsr_improvement, 2),
+                    "review_growth_30": round(review_growth_30, 2),
+                    "offer_count": int(offer_count),
+                    "effective_price": float(row.get("effective_price") or 0.0) if row.get("effective_price") is not None else None,
+                    "reasons": reasons,
+                }
+            )
+
+        predictions.sort(key=lambda item: item["heuristic_score"], reverse=True)
+        top_predictions = predictions[: request.top_n]
+        bullish_count = sum(1 for item in predictions if item["heuristic_score"] >= 10)
+        risk_count = sum(1 for item in predictions if item["heuristic_score"] <= -5)
+
+        opportunity_flags: list[str] = []
+        risk_flags: list[str] = []
+        if any(item["sales_momentum_pct"] > 10 for item in predictions):
+            opportunity_flags.append("some_candidates_show_positive_sales_momentum")
+        if any(item["trend_momentum_pct"] > 8 for item in predictions):
+            opportunity_flags.append("topic_has_rising_trend_signal")
+        if any(item["offer_count"] > 20 for item in predictions):
+            risk_flags.append("part_of_the_pool_has_high_offer_competition")
+        if not predictions:
+            risk_flags.append("no_candidate_signals_available")
+
+        return {
+            "marketplace": marketplace,
+            "domain": domain,
+            "forecast_type": "heuristic_v1",
+            "window_days": effective_window_days,
+            "bullish_asin_count": bullish_count,
+            "risk_asin_count": risk_count,
+            "predicted_top_asins": top_predictions,
+            "opportunity_flags": opportunity_flags,
+            "risk_flags": risk_flags,
+            "notes": [
+                "this is a weak-signal heuristic forecast, not a trained online prediction model",
+                "score combines sales momentum, trend momentum, bsr improvement, review growth, and offer competition",
+            ],
+        }
+
+    def get_top_asin_drilldown(self, request: DrilldownRequest) -> dict[str, Any]:
+        domain, marketplace = _normalize_marketplace(request.marketplace)
+        candidate_asins = _sanitize_asins(request.candidate_asins)
+        if request.top_n is not None:
+            candidate_asins = candidate_asins[: request.top_n]
+        effective_window_days = _effective_feature_window_days(request.window_days)
+
+        with _postgres_conn() as conn:
+            rows = _run_pg_dict_query(
+                conn,
+                """
+            WITH max_date AS (
+                SELECT MAX(date) AS max_date
+                FROM serving.theme_base_daily
+                WHERE domain = %s
+            ),
+            filtered AS (
+                SELECT *
+                FROM serving.theme_base_daily
+                WHERE domain = %s
+                  AND asin = ANY(%s)
+                  AND date >= (
+                      SELECT max_date - (%s * INTERVAL '1 day')
+                      FROM max_date
+                  )
+            ),
+            latest_ranked AS (
+                SELECT
+                    asin,
+                    domain,
+                    product_title,
+                    brand,
+                    category,
+                    effective_price,
+                    rating,
+                    review_count,
+                    COALESCE(new_offer_count, 0) + COALESCE(used_offer_count, 0) AS offer_count,
+                    bsr,
+                    estimated_daily_sales,
+                    date,
+                    ROW_NUMBER() OVER (PARTITION BY asin, domain ORDER BY date DESC) AS rn
+                FROM filtered
+            ),
+            latest AS (
+                SELECT
+                    asin,
+                    domain,
+                    product_title,
+                    brand,
+                    category,
+                    effective_price,
+                    rating,
+                    review_count,
+                    offer_count,
+                    bsr,
+                    estimated_daily_sales,
+                    date
+                FROM latest_ranked
+                WHERE rn = 1
+            ),
+            summary AS (
+                SELECT
+                    asin,
+                    domain,
+                    SUM(COALESCE(estimated_daily_sales, 0)) AS sales_window_sum,
+                    AVG(estimated_daily_sales) AS sales_daily_avg,
+                    MIN(effective_price) AS price_min_window,
+                    MAX(effective_price) AS price_max_window,
+                    MAX(review_count) - MIN(review_count) AS review_growth_window,
+                    AVG(COALESCE(new_offer_count, 0) + COALESCE(used_offer_count, 0)) AS offer_count_avg_window,
+                    AVG(bsr) AS bsr_avg_window
+                FROM filtered
+                GROUP BY 1, 2
+            )
+            SELECT
+                l.asin,
+                l.product_title,
+                l.brand,
+                l.category,
+                l.effective_price,
+                l.rating,
+                l.review_count,
+                l.offer_count,
+                l.bsr,
+                l.estimated_daily_sales,
+                l.date AS latest_date,
+                s.sales_window_sum,
+                s.sales_daily_avg,
+                s.price_min_window,
+                s.price_max_window,
+                s.review_growth_window,
+                s.offer_count_avg_window,
+                s.bsr_avg_window
+            FROM latest l
+            LEFT JOIN summary s USING (asin, domain)
+                """,
+                [domain, domain, candidate_asins, effective_window_days - 1],
+            )
+
+        return {
+            "marketplace": marketplace,
+            "domain": domain,
+            "window_days": effective_window_days,
+            "items": rows,
+        }
+
+    def get_category_benchmark(self, request: CandidatePoolRequest) -> dict[str, Any]:
+        """Return L3-level category benchmark stats for comparison with candidate pool.
+
+        Strategy:
+        1. Get each candidate ASIN's leaf category_id from keepa_asin_registry
+        2. Walk up parent_id chain in keepa_category_registry to find L3 ancestor (depth=3)
+        3. Pick the dominant L3 category (mode) as the benchmark anchor
+        4. Aggregate all ASINs whose category_id descends from that L3 node
+        """
+        domain, marketplace = _normalize_marketplace(request.marketplace)
+        candidate_asins = _sanitize_asins(request.candidate_asins)
+        effective_window_days = min(request.window_days, 90)
+
+        with _postgres_conn() as conn:
+            # ── Step 1+2: resolve each candidate ASIN's L3 ancestor category ──
+            l3_rows = _run_pg_dict_query(
+                conn,
+                """
+                WITH RECURSIVE
+                candidate_leaf AS (
+                    SELECT asin, category_id
+                    FROM sync.keepa_asin_registry
+                    WHERE domain = %s
+                      AND asin = ANY(%s)
+                      AND category_id IS NOT NULL
+                ),
+                -- walk up category tree to find L3 ancestor for each leaf
+                ancestors AS (
+                    SELECT
+                        cl.asin,
+                        c.category_id,
+                        c.parent_id,
+                        c.depth,
+                        c.category_en,
+                        c.category_cn
+                    FROM candidate_leaf cl
+                    JOIN sync.keepa_category_registry c
+                        ON cl.category_id = c.category_id AND c.domain = %s
+
+                    UNION ALL
+
+                    SELECT
+                        a.asin,
+                        p.category_id,
+                        p.parent_id,
+                        p.depth,
+                        p.category_en,
+                        p.category_cn
+                    FROM ancestors a
+                    JOIN sync.keepa_category_registry p
+                        ON a.parent_id = p.category_id AND p.domain = %s
+                    WHERE a.depth > 3
+                )
+                SELECT
+                    asin,
+                    category_id AS l3_category_id,
+                    COALESCE(category_cn, category_en, 'Unknown') AS l3_category_name,
+                    category_en AS l3_category_en,
+                    depth
+                FROM ancestors
+                WHERE depth = 3
+
+                UNION ALL
+
+                -- fallback: if leaf depth <= 3, use itself as the best available level
+                SELECT
+                    cl.asin,
+                    c.category_id AS l3_category_id,
+                    COALESCE(c.category_cn, c.category_en, 'Unknown') AS l3_category_name,
+                    c.category_en AS l3_category_en,
+                    c.depth
+                FROM candidate_leaf cl
+                JOIN sync.keepa_category_registry c
+                    ON cl.category_id = c.category_id AND c.domain = %s
+                WHERE c.depth <= 3
+                  AND cl.asin NOT IN (
+                      SELECT asin FROM ancestors WHERE depth = 3
+                  )
+                """,
+                [domain, candidate_asins, domain, domain, domain],
+            )
+
+        if not l3_rows:
+            return {
+                "marketplace": marketplace,
+                "domain": domain,
+                "window_days": request.window_days,
+                "benchmark_category": None,
+                "benchmark_category_level": None,
+                "candidate_asin_count_in_category": 0,
+                "category_total_asin_count": 0,
+                "candidate_category_coverage_pct": 0,
+                "all_candidate_l3_categories": [],
+                "benchmark_stats": {},
+                "notes": ["未能从候选池 ASIN 的类目信息中解析出 L3 类目"],
+            }
+
+        # ── Step 3: pick dominant L3 category (mode) ──
+        from collections import Counter
+        l3_counter: Counter[int] = Counter()
+        l3_name_map: dict[int, str] = {}
+        l3_en_map: dict[int, str] = {}
+        l3_depth_map: dict[int, int] = {}
+        for row in l3_rows:
+            cat_id = int(row["l3_category_id"])
+            l3_counter[cat_id] += 1
+            l3_name_map[cat_id] = row["l3_category_name"]
+            l3_en_map[cat_id] = row.get("l3_category_en") or ""
+            l3_depth_map[cat_id] = int(row["depth"])
+
+        dominant_l3_id, dominant_count = l3_counter.most_common(1)[0]
+        dominant_l3_name = l3_name_map[dominant_l3_id]
+        dominant_l3_en = l3_en_map[dominant_l3_id]
+        dominant_depth = l3_depth_map[dominant_l3_id]
+
+        # all L3 categories for transparency
+        all_l3_cats = [
+            {
+                "l3_category_id": cat_id,
+                "l3_category_name": l3_name_map[cat_id],
+                "l3_category_en": l3_en_map[cat_id],
+                "depth": l3_depth_map[cat_id],
+                "candidate_asin_count": count,
+            }
+            for cat_id, count in l3_counter.most_common()
+        ]
+
+        # ── Step 4: find all ASINs that descend from the dominant L3 category ──
+        # Use recursive CTE to get all descendant category_ids under dominant L3
+        with _postgres_conn() as conn:
+            bench_rows = _run_pg_dict_query(
+                conn,
+                """
+                WITH RECURSIVE
+                subtree AS (
+                    SELECT category_id
+                    FROM sync.keepa_category_registry
+                    WHERE category_id = %s AND domain = %s
+
+                    UNION ALL
+
+                    SELECT c.category_id
+                    FROM sync.keepa_category_registry c
+                    JOIN subtree s ON c.parent_id = s.category_id
+                    WHERE c.domain = %s
+                ),
+                category_asins AS (
+                    SELECT r.asin
+                    FROM sync.keepa_asin_registry r
+                    WHERE r.domain = %s
+                      AND r.category_id IN (SELECT category_id FROM subtree)
+                ),
+                latest_history AS (
+                    SELECT * FROM (
+                        SELECT
+                            h.asin,
+                            COALESCE(h.buy_box_price, h.amazon_price, h.new_price) AS effective_price,
+                            h.bsr,
+                            h.rating,
+                            h.review_count,
+                            h.monthly_sold,
+                            COALESCE(h.new_offer_count, 0) + COALESCE(h.used_offer_count, 0) AS offer_count,
+                            ROW_NUMBER() OVER (PARTITION BY h.asin ORDER BY h.date DESC) AS rn
+                        FROM sync.keepa_product_history h
+                        JOIN category_asins ca ON h.asin = ca.asin
+                        WHERE h.domain = %s
+                          AND h.date >= CURRENT_DATE - (%s * INTERVAL '1 day')
+                    ) ranked
+                    WHERE rn = 1
+                )
+                SELECT
+                    COUNT(DISTINCT asin) AS category_total_asin_count,
+                    AVG(effective_price) AS avg_price,
+                    PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY effective_price) AS price_p25,
+                    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY effective_price) AS price_p50,
+                    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY effective_price) AS price_p75,
+                    AVG(rating) AS avg_rating,
+                    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY rating) AS median_rating,
+                    AVG(review_count) AS avg_review_count,
+                    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY review_count) AS median_review_count,
+                    AVG(bsr) AS avg_bsr,
+                    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY bsr) AS median_bsr,
+                    SUM(COALESCE(monthly_sold, 0)) AS sum_monthly_sold,
+                    AVG(monthly_sold) AS avg_monthly_sold,
+                    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY offer_count) AS median_offer_count
+                FROM latest_history
+                """,
+                [dominant_l3_id, domain, domain, domain, domain, effective_window_days],
+            )
+
+        def _safe_round(val: Any, decimals: int = 2) -> float | None:
+            return round(float(val), decimals) if val is not None else None
+
+        def _safe_int(val: Any) -> int | None:
+            return int(val) if val is not None else None
+
+        stats = bench_rows[0] if bench_rows else {}
+        cat_total = int(stats.get("category_total_asin_count") or 0)
+
+        benchmark_stats = {
+            "avg_price": _safe_round(stats.get("avg_price")),
+            "price_distribution": {
+                "p25": _safe_round(stats.get("price_p25")),
+                "p50": _safe_round(stats.get("price_p50")),
+                "p75": _safe_round(stats.get("price_p75")),
+            },
+            "rating_distribution": {
+                "avg": _safe_round(stats.get("avg_rating")),
+                "median": _safe_round(stats.get("median_rating")),
+            },
+            "avg_review_count": _safe_round(stats.get("avg_review_count")),
+            "median_review_count": _safe_int(stats.get("median_review_count")),
+            "bsr_distribution": {
+                "avg": _safe_round(stats.get("avg_bsr")),
+                "median": _safe_int(stats.get("median_bsr")),
+            },
+            "sum_monthly_sold": _safe_round(stats.get("sum_monthly_sold")),
+            "avg_monthly_sold": _safe_round(stats.get("avg_monthly_sold")),
+            "median_offer_count": _safe_round(stats.get("median_offer_count")),
+        }
+
+        return {
+            "marketplace": marketplace,
+            "domain": domain,
+            "window_days": effective_window_days,
+            "benchmark_category": {
+                "category_id": dominant_l3_id,
+                "category_name": dominant_l3_name,
+                "category_en": dominant_l3_en,
+                "depth": dominant_depth,
+                "level": f"L{dominant_depth}",
+            },
+            "benchmark_category_level": f"L{dominant_depth}",
+            "candidate_asin_count_in_category": dominant_count,
+            "category_total_asin_count": cat_total,
+            "candidate_category_coverage_pct": round(
+                dominant_count / cat_total * 100, 2
+            ) if cat_total > 0 else 0,
+            "all_candidate_l3_categories": all_l3_cats,
+            "benchmark_stats": benchmark_stats,
+            "notes": [
+                f"对标类目由候选池 ASIN 的众数 L{dominant_depth} 类目自动选取",
+                f"候选池中 {dominant_count}/{len(candidate_asins)} 个 ASIN 属于此类目",
+                "聚合范围包含该 L3 类目及其所有子类目下的全部 ASIN",
+                *( ["当前 benchmark 读取 PostgreSQL sync.keepa_product_history，在线窗口上限为近 90 天"] if request.window_days > effective_window_days else [] ),
+            ],
+        }
+
+    def _fetch_business_tier_distribution(self, domain: int, candidate_asins: list[str]) -> dict[str, int]:
+                with _postgres_conn() as conn:
+                        rows = _run_pg_dict_query(
+                conn,
+                                """
+                SELECT COALESCE(business_tier, 'UNKNOWN') AS business_tier, COUNT(*) AS count
+                                FROM sync.keepa_asin_registry
+                                WHERE domain = %s
+                                    AND asin = ANY(%s)
+                GROUP BY 1
+                ORDER BY count DESC, business_tier ASC
+                                """,
+                                [domain, candidate_asins],
+            )
+                return {str(row["business_tier"]): int(row["count"]) for row in rows}
+
+    def keepa_asin_lookup(self, request: KeepaAsinLookupRequest) -> dict[str, Any]:
+        domain, marketplace = _normalize_marketplace(request.marketplace)
+        asins = _sanitize_asins(request.asins)
+        if not asins:
+            raise HTTPException(status_code=400, detail="no valid ASINs provided")
+        if len(asins) > 20:
+            asins = asins[:20]
+
+        keepa_api_key = os.environ.get("KEEPA_API_KEY", "").strip()
+        if not keepa_api_key:
+            raise HTTPException(status_code=500, detail="KEEPA_API_KEY not configured")
+
+        keepa_base_url = os.environ.get("KEEPA_BASE_URL", "https://api.keepa.com/product").strip()
+        keepa_timeout = int(os.environ.get("KEEPA_TIMEOUT", "30"))
+        stats_window = 30
+
+        try:
+            resp = http_requests.get(
+                keepa_base_url,
+                params={
+                    "key": keepa_api_key,
+                    "domain": domain,
+                    "asin": ",".join(asins),
+                    "history": 1,
+                    "stats": stats_window,
+                    "rating": 1,
+                },
+                timeout=keepa_timeout,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except http_requests.RequestException as exc:
+            raise HTTPException(status_code=502, detail=f"Keepa API request failed: {exc}")
+
+        products = payload.get("products") or []
+        if not products:
+            return {
+                "marketplace": marketplace,
+                "domain": domain,
+                "source": "keepa_api",
+                "tokens_left": payload.get("tokensLeft"),
+                "items": [],
+                "notes": ["Keepa API 未返回任何商品数据，请检查 ASIN 是否正确"],
+            }
+
+        is_yen = domain in {5}
+        items: list[dict[str, Any]] = []
+
+        for product in products:
+            csv = product.get("csv") or []
+            stats = product.get("stats") or {}
+            stats_current = stats.get("current") or []
+
+            category = product.get("productGroup")
+            cat_tree = product.get("categoryTree") or []
+            if cat_tree:
+                names = [n.get("name", "") for n in cat_tree if n.get("name")]
+                if names:
+                    category = names[-1]
+
+            effective_price = _keepa_latest_price(csv, 18, is_yen)
+            if effective_price is None:
+                effective_price = _keepa_latest_price(csv, 0, is_yen)
+            if effective_price is None:
+                effective_price = _keepa_latest_price(csv, 1, is_yen)
+
+            rating_raw = _keepa_latest_value(csv, 16)
+            rating = round(rating_raw / 10, 1) if rating_raw is not None and rating_raw > 0 else None
+
+            review_count = _keepa_latest_value(csv, 17)
+            new_count = _keepa_latest_value(csv, 11) or 0
+            used_count = _keepa_latest_value(csv, 12) or 0
+            offer_count = (new_count or 0) + (used_count or 0)
+
+            bsr = _keepa_latest_value(csv, 3)
+
+            monthly_sold = product.get("monthlySold")
+            est_daily_sales = round(monthly_sold / 30, 1) if monthly_sold and monthly_sold > 0 else None
+
+            stats_avg = stats.get("avg") or []
+            sales_window_sum = None
+            sales_daily_avg = None
+            if est_daily_sales is not None:
+                sales_window_sum = round(est_daily_sales * stats_window, 1)
+                sales_daily_avg = est_daily_sales
+
+            price_min_window = _keepa_stats_price(stats, "min", 18, is_yen)
+            price_max_window = _keepa_stats_price(stats, "max", 18, is_yen)
+
+            bsr_avg_raw = _keepa_stats_value(stats_avg, 3)
+            bsr_avg_window = round(float(bsr_avg_raw), 1) if bsr_avg_raw is not None else None
+
+            items.append({
+                "asin": product.get("asin"),
+                "product_title": product.get("title"),
+                "brand": product.get("brand"),
+                "category": category,
+                "effective_price": effective_price,
+                "rating": rating,
+                "review_count": int(review_count) if review_count is not None else None,
+                "offer_count": offer_count if offer_count > 0 else None,
+                "bsr": int(bsr) if bsr is not None else None,
+                "estimated_daily_sales": est_daily_sales,
+                "latest_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                "sales_window_sum": sales_window_sum,
+                "sales_daily_avg": sales_daily_avg,
+                "price_min_window": price_min_window,
+                "price_max_window": price_max_window,
+                "review_growth_window": None,
+                "offer_count_avg_window": None,
+                "bsr_avg_window": bsr_avg_window,
+            })
+
+        return {
+            "marketplace": marketplace,
+            "domain": domain,
+            "source": "keepa_api",
+            "tokens_left": payload.get("tokensLeft"),
+            "items": items,
+            "notes": [
+                "数据直接来自 Keepa API 实时查询，非本地数据库缓存",
+                f"estimated_daily_sales 由 monthlySold / 30 估算",
+                f"当本地数据库查不到 ASIN 时可用此工具作为补充数据源",
+            ],
+        }
+
+
+app = FastAPI(title="xiamimate Product Theme API", version="2026-04-10")
+service = ProductThemeService()
+
+
+@app.on_event("startup")
+def warmup_connection_pools() -> None:
+    """Pre-load PostgreSQL pool and serving metadata to reduce cold-start latency."""
+    import time as _time
+    t0 = _time.monotonic()
+    try:
+        with _postgres_conn() as conn:
+            _run_pg_dict_query(conn, "SELECT 1 AS ok")
+    except Exception:
+        pass
+    try:
+        _get_theme_feature_serving_status(include_data_max_date=False)
+    except Exception:
+        pass
+    elapsed = _time.monotonic() - t0
+    print(f"[startup] connection warmup completed in {elapsed:.1f}s")
+
+
+@app.middleware("http")
+async def metered_api_key_middleware(request: Request, call_next):
+    endpoint = request.url.path
+    if not endpoint.startswith(PROTECTED_API_PREFIX):
+        return await call_next(request)
+
+    supplied_api_key = (request.headers.get(API_KEY_HEADER_NAME) or "").strip()
+    if not supplied_api_key:
+        supplied_api_key = (_extract_bearer_token(request.headers.get("Authorization")) or "").strip()
+    if not supplied_api_key:
+        return _auth_error_response(
+            endpoint=endpoint,
+            status_code=401,
+            code="UNAUTHORIZED",
+            message="missing api key",
+        )
+
+    api_key_record = resolve_api_key(supplied_api_key)
+    if api_key_record is None:
+        return _auth_error_response(
+            endpoint=endpoint,
+            status_code=401,
+            code="UNAUTHORIZED",
+            message="invalid api key",
+        )
+    if api_key_record.status != "active":
+        return _auth_error_response(
+            endpoint=endpoint,
+            status_code=403,
+            code="API_KEY_INACTIVE",
+            message="api key is inactive",
+        )
+
+    request.state.api_key_record = api_key_record
+    import time as _mw_time
+    t0 = _mw_time.monotonic()
+    response = await call_next(request)
+    elapsed_ms = int((_mw_time.monotonic() - t0) * 1000)
+    record_api_usage(api_key_record.key_id, endpoint, response.status_code, response_time_ms=elapsed_ms)
+    return response
+
+
+@app.exception_handler(HTTPException)
+def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    endpoint = request.url.path
+    code = "UNAUTHORIZED" if exc.status_code == 401 else "REQUEST_ERROR"
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_error_response(endpoint=endpoint, code=code, message=str(exc.detail)),
+    )
+
+
+@app.exception_handler(Exception)
+def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    return JSONResponse(
+        status_code=500,
+        content=_error_response(endpoint=request.url.path, code="INTERNAL_ERROR", message=str(exc)),
+    )
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    active_key_count = get_active_key_count()
+    query_normalizer = _get_query_normalizer_config()
+    feature_serving = _get_theme_feature_serving_status(include_data_max_date=False)
+    return _success_response(
+        endpoint="/health",
+        message="service is healthy",
+        data={
+            "status": "ok",
+            "online_store": {
+                "type": "postgresql",
+                "schemas": ["sync", "serving"],
+                "host": os.environ.get("PG_HOST", "localhost"),
+                "port": int(os.environ.get("PG_PORT", "5432")),
+                "dbname": os.environ.get("PG_DB", "xiamimate"),
+            },
+            "theme_feature_serving": feature_serving,
+            "offline_feature_artifacts": {
+                "dir": str(DEFAULT_FEATURE_DIR),
+                "role": "offline_training_and_feature_build_outputs",
+            },
+            "auth": {
+                "mode": "pg_api_key_auth_with_usage_audit",
+                "header_name": API_KEY_HEADER_NAME,
+                "client_env_var": API_KEY_ENV_VAR,
+                "active_key_count": active_key_count,
+                "configured": active_key_count > 0,
+                "quota_model": "disabled_managed_by_chat_backend",
+                "enforcement": "api_key_presence_and_status_only",
+            },
+            "query_normalizer": {
+                "active_profile": query_normalizer["active_profile"],
+                "mode": query_normalizer["mode"],
+                "enabled": query_normalizer["enabled"],
+                "configured": query_normalizer["configured"],
+                "base_url": query_normalizer["base_url"],
+                "model": query_normalizer["model"],
+                "timeout_seconds": query_normalizer["timeout_seconds"],
+                "env_file_autoload": str(ROOT_ENV_FILE),
+            },
+        },
+    )
+
+
+@app.post("/api/product-theme/resolve-candidates")
+async def resolve_candidates(request: ResolveCandidatesRequest) -> dict[str, Any]:
+    return _success_response(
+        endpoint="/api/product-theme/resolve-candidates",
+        message="candidate pool resolved",
+        data=await service.resolve_candidates(request),
+    )
+
+
+@app.post("/api/product-theme/candidate-pool-stats")
+def candidate_pool_stats(request: CandidatePoolRequest) -> dict[str, Any]:
+    return _success_response(
+        endpoint="/api/product-theme/candidate-pool-stats",
+        message="candidate pool stats ready",
+        data=service.get_candidate_pool_stats(request),
+    )
+
+
+@app.post("/api/product-theme/candidate-pool-trends")
+def candidate_pool_trends(request: CandidatePoolRequest) -> dict[str, Any]:
+    return _success_response(
+        endpoint="/api/product-theme/candidate-pool-trends",
+        message="candidate pool trends ready",
+        data=service.get_candidate_pool_trends(request),
+    )
+
+
+@app.post("/api/product-theme/candidate-pool-weak-forecast")
+def candidate_pool_weak_forecast(request: WeakForecastRequest) -> dict[str, Any]:
+    return _success_response(
+        endpoint="/api/product-theme/candidate-pool-weak-forecast",
+        message="candidate pool weak forecast ready",
+        data=service.get_candidate_pool_weak_forecast(request),
+    )
+
+
+@app.post("/api/product-theme/top-asin-drilldown")
+def top_asin_drilldown(request: DrilldownRequest) -> dict[str, Any]:
+    return _success_response(
+        endpoint="/api/product-theme/top-asin-drilldown",
+        message="top asin drilldown ready",
+        data=service.get_top_asin_drilldown(request),
+    )
+
+
+@app.post("/api/product-theme/category-benchmark")
+def category_benchmark(request: CandidatePoolRequest) -> dict[str, Any]:
+    return _success_response(
+        endpoint="/api/product-theme/category-benchmark",
+        message="category benchmark ready",
+        data=service.get_category_benchmark(request),
+    )
+
+
+@app.post("/api/product-theme/keepa-asin-lookup")
+def keepa_asin_lookup(request: KeepaAsinLookupRequest) -> dict[str, Any]:
+    return _success_response(
+        endpoint="/api/product-theme/keepa-asin-lookup",
+        message="keepa asin lookup ready",
+        data=service.keepa_asin_lookup(request),
+    )
