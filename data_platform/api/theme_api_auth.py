@@ -18,6 +18,7 @@ except ImportError:
     psycopg2 = None  # type: ignore[assignment]
 
 API_KEY_ENV_VAR = "XIAMIMATE_THEME_API_KEY"
+API_KEY_NAME_ENV_VAR = "XIAMIMATE_THEME_API_KEY_NAME"
 DEFAULT_API_KEY_PREFIX = "xia_theme_"
 DEFAULT_API_KEY_LENGTH = 40
 DEFAULT_DAILY_QUOTA = 1000
@@ -279,6 +280,84 @@ def create_api_key(
         ),
         api_key,
     )
+
+
+def ensure_env_api_key_registered() -> APIKeyRecord | None:
+    api_key = os.environ.get(API_KEY_ENV_VAR, "").strip()
+    if not api_key:
+        return None
+
+    key_hash = hash_api_key(api_key)
+    key_prefix = api_key[: min(len(api_key), 18)]
+    key_name = os.environ.get(API_KEY_NAME_ENV_VAR, "env-bootstrap").strip() or "env-bootstrap"
+    normalized_tier = normalize_tier(DEFAULT_CREATE_TIER)
+    resolved_daily_quota = resolve_tier_quota(normalized_tier)
+    stored_daily_quota = 0 if resolved_daily_quota is None else resolved_daily_quota
+
+    with _pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT key_id, name, tier, key_prefix, key_raw, status, daily_quota, created_at, revoked_at, last_used_at
+                FROM {_API_KEYS_TABLE}
+                WHERE key_hash = %s
+                LIMIT 1
+                """,
+                (key_hash,),
+            )
+            row = _dict_row(cur)
+
+            if row is None:
+                key_id = f"key_{secrets.token_hex(8)}"
+                created_at = utc_now_iso()
+                cur.execute(
+                    f"""
+                    INSERT INTO {_API_KEYS_TABLE} (
+                        key_id, name, tier, key_prefix, key_hash, key_raw, status, daily_quota, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, 'active', %s, %s)
+                    """,
+                    (key_id, key_name, normalized_tier, key_prefix, key_hash, api_key, stored_daily_quota, created_at),
+                )
+                return APIKeyRecord(
+                    key_id=key_id,
+                    name=key_name,
+                    tier=normalized_tier,
+                    key_prefix=key_prefix,
+                    key_raw=api_key,
+                    status="active",
+                    daily_quota=resolved_daily_quota,
+                    created_at=created_at,
+                    revoked_at=None,
+                    last_used_at=None,
+                )
+
+            cur.execute(
+                f"""
+                UPDATE {_API_KEYS_TABLE}
+                SET
+                    name = COALESCE(NULLIF(name, ''), %s),
+                    key_prefix = %s,
+                    key_raw = %s,
+                    status = 'active',
+                    revoked_at = NULL
+                WHERE key_id = %s
+                """,
+                (key_name, key_prefix, api_key, row["key_id"]),
+            )
+            cur.execute(
+                f"""
+                SELECT key_id, name, tier, key_prefix, key_raw, status, daily_quota, created_at, revoked_at, last_used_at
+                FROM {_API_KEYS_TABLE}
+                WHERE key_id = %s
+                LIMIT 1
+                """,
+                (row["key_id"],),
+            )
+            updated_row = _dict_row(cur)
+
+    if updated_row is None:
+        return None
+    return _row_to_api_key_record(updated_row)
 
 
 def resolve_api_key(api_key: str) -> APIKeyRecord | None:

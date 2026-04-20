@@ -30,7 +30,9 @@ from data_platform.product_query_assistant import ProductRecallQueryAssistant
 
 from data_platform.api.theme_api_auth import (
     API_KEY_ENV_VAR,
+    API_KEY_NAME_ENV_VAR,
     APIKeyRecord,
+    ensure_env_api_key_registered,
     get_active_key_count,
     record_api_usage,
     resolve_api_key,
@@ -1794,6 +1796,10 @@ def warmup_connection_pools() -> None:
     import time as _time
     t0 = _time.monotonic()
     try:
+        ensure_env_api_key_registered()
+    except Exception as exc:
+        print(f"[startup] api key bootstrap skipped: {exc}")
+    try:
         with _postgres_conn() as conn:
             _run_pg_dict_query(conn, "SELECT 1 AS ok")
     except Exception:
@@ -1892,10 +1898,12 @@ def health() -> dict[str, Any]:
                 "mode": "pg_api_key_auth_with_usage_audit",
                 "header_name": API_KEY_HEADER_NAME,
                 "client_env_var": API_KEY_ENV_VAR,
+                "bootstrap_env_var": API_KEY_NAME_ENV_VAR,
                 "active_key_count": active_key_count,
                 "configured": active_key_count > 0,
                 "quota_model": "disabled_managed_by_chat_backend",
                 "enforcement": "api_key_presence_and_status_only",
+                "bootstrap": "startup_auto_register_from_env_when_present",
             },
             "query_normalizer": {
                 "active_profile": query_normalizer["active_profile"],

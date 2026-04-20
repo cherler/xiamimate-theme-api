@@ -34,9 +34,10 @@
    - `XIAMIMATE_PYTHON_BIN`
    - `PG_HOST/PG_PORT/PG_DB/PG_USER/PG_PASSWORD`
    - `XIAMIMATE_THEME_API_KEY`
-3. 用正式端口启动：
+3. 启动时会自动把 `XIAMIMATE_THEME_API_KEY` 注册到 `serving.api_keys`；如果 health 里仍显示 `active_key_count=0`，通常说明服务还没按新代码重启。
+4. 用正式端口启动：
    - `bash scripts/manage_theme_api.sh start`
-4. 跑 smoke test：
+5. 跑 smoke test：
    - `bash scripts/smoke_test_product_theme_api.sh`
 
 PostgreSQL DDL：
