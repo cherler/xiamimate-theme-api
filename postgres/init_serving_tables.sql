@@ -7,6 +7,8 @@
 -- >>> BEGIN migrations/serving/010_serving_theme_feature_tables.sql
 -- serving.* feature tables consumed by theme-api, rebuilt by collector.
 
+CREATE SCHEMA IF NOT EXISTS serving;
+
 CREATE TABLE IF NOT EXISTS serving.theme_base_daily (
     domain                INTEGER NOT NULL,
     asin                  VARCHAR NOT NULL,
