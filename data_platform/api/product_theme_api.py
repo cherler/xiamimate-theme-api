@@ -673,6 +673,80 @@ class ProductThemeService:
             "forecast_year_week": coverage_row.get("forecast_year_week"),
         }
 
+    def _normalize_top_feature_contributions(self, raw_value: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw_value, list):
+            return []
+
+        normalized: list[dict[str, Any]] = []
+        for item in raw_value:
+            if not isinstance(item, dict):
+                continue
+            normalized.append(
+                {
+                    "feature": item.get("feature"),
+                    "label": item.get("label"),
+                    "direction": item.get("direction"),
+                    "contribution_share": round(float(item["contribution_share"]), 4)
+                    if item.get("contribution_share") is not None
+                    else None,
+                }
+            )
+        return normalized
+
+    def _build_item_sales_forecast_explainability(self, forecast_row: dict[str, Any] | None = None) -> dict[str, Any]:
+        forecast_row = forecast_row or {}
+        return {
+            "primary_driver_feature": forecast_row.get("primary_driver_feature"),
+            "primary_driver_label": forecast_row.get("primary_driver_label"),
+            "primary_driver_direction": forecast_row.get("primary_driver_direction"),
+            "primary_driver_contribution_share": round(float(forecast_row["primary_driver_contribution_share"]), 4)
+            if forecast_row.get("primary_driver_contribution_share") is not None
+            else None,
+            "top_feature_contributions": self._normalize_top_feature_contributions(
+                forecast_row.get("top_feature_contributions")
+            ),
+            "driver_summary_text": forecast_row.get("driver_summary_text"),
+        }
+
+    def _build_candidate_pool_driver_distribution(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not rows:
+            return []
+
+        grouped: dict[tuple[str | None, str | None, str | None], dict[str, Any]] = {}
+        for row in rows:
+            driver_feature = row.get("primary_driver_feature")
+            driver_label = row.get("primary_driver_label") or driver_feature
+            driver_direction = row.get("primary_driver_direction")
+            if not driver_feature and not driver_label:
+                continue
+            key = (driver_feature, driver_label, driver_direction)
+            bucket = grouped.setdefault(
+                key,
+                {
+                    "driver_feature": driver_feature,
+                    "driver_label": driver_label,
+                    "driver_direction": driver_direction,
+                    "item_count": 0,
+                },
+            )
+            bucket["item_count"] += 1
+
+        denominator = sum(int(item["item_count"]) for item in grouped.values())
+        if denominator <= 0:
+            return []
+
+        distribution = []
+        for item in grouped.values():
+            distribution.append(
+                {
+                    **item,
+                    "item_ratio": round(int(item["item_count"]) / denominator, 4),
+                }
+            )
+
+        distribution.sort(key=lambda item: (-int(item["item_count"]), str(item.get("driver_label") or "")))
+        return distribution
+
     def _build_candidate_pool_sales_forecast_empty(
         self,
         *,
@@ -694,6 +768,7 @@ class ProductThemeService:
                 "predicted_sales_w1_median": None,
                 "high_growth_item_ratio": None,
                 "top20_predicted_sales_w4_share": None,
+                "driver_distribution": [],
                 "predicted_top_asins_w4": [],
                 "notes": notes or [],
             }
@@ -719,6 +794,12 @@ class ProductThemeService:
                 "predicted_rank_w4_within_domain": None,
                 "model_config_name_w1": coverage_row.get("model_config_name_w1") if coverage_row else None,
                 "model_config_name_w4": coverage_row.get("model_config_name_w4") if coverage_row else None,
+                "primary_driver_feature": None,
+                "primary_driver_label": None,
+                "primary_driver_direction": None,
+                "primary_driver_contribution_share": None,
+                "top_feature_contributions": [],
+                "driver_summary_text": None,
                 "notes": notes or [],
             }
         )
@@ -777,7 +858,13 @@ class ProductThemeService:
                 test_smape_w1,
                 test_smape_w4,
                 test_r2_w1,
-                test_r2_w4
+                                test_r2_w4,
+                                primary_driver_feature,
+                                primary_driver_label,
+                                primary_driver_direction,
+                                primary_driver_contribution_share,
+                                top_feature_contributions,
+                                driver_summary_text
             FROM {THEME_FORECAST_SERVING_TABLES['item_current']}
             WHERE domain = %s
               AND asin = ANY(%s)
@@ -867,6 +954,13 @@ class ProductThemeService:
             for row in covered_rows
             if row.get("predicted_growth_ratio_w4_over_w1") is not None
         ]
+        high_growth_driver_rows = [
+            row
+            for row in covered_rows
+            if row.get("predicted_growth_ratio_w4_over_w1") is not None
+            and float(row["predicted_growth_ratio_w4_over_w1"]) >= FORECAST_HIGH_GROWTH_RATIO_THRESHOLD
+        ]
+        driver_rows = high_growth_driver_rows or covered_rows
         predicted_top_rows = sorted(
             covered_rows,
             key=lambda row: float(row.get("predicted_weekly_sales_w4") or float("-inf")),
@@ -900,6 +994,7 @@ class ProductThemeService:
                     if total_w4 not in (None, 0.0) and top20_w4 is not None
                     else None
                 ),
+                "driver_distribution": self._build_candidate_pool_driver_distribution(driver_rows),
                 "predicted_top_asins_w4": [
                     {
                         "asin": str(row["asin"]),
@@ -912,6 +1007,9 @@ class ProductThemeService:
                         "predicted_rank_w4_within_domain": int(row["predicted_rank_w4_within_domain"])
                         if row.get("predicted_rank_w4_within_domain") is not None
                         else None,
+                        "primary_driver_feature": row.get("primary_driver_feature"),
+                        "primary_driver_label": row.get("primary_driver_label"),
+                        "primary_driver_direction": row.get("primary_driver_direction"),
                     }
                     for row in predicted_top_rows[:FORECAST_TOP_ASINS_LIMIT]
                 ],
@@ -1764,6 +1862,7 @@ class ProductThemeService:
                         "notes": [],
                     }
                 )
+                sales_forecast.update(self._build_item_sales_forecast_explainability(forecast_row))
             elif sales_forecast_meta["status"] == FORECAST_STATUS_MISSING_DOMAIN_MODEL:
                 sales_forecast = self._build_item_sales_forecast_empty(
                     status=FORECAST_STATUS_MISSING_DOMAIN_MODEL,
