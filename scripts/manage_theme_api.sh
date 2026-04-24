@@ -84,6 +84,7 @@ start_api() {
 
     cleanup_metadata
     nohup "$PYTHON_BIN" -m uvicorn data_platform.api.product_theme_api:app \
+        --app-dir "$ROOT_DIR" \
         --host "$HOST" --port "$PORT" >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
 

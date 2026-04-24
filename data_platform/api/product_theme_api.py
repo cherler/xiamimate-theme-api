@@ -8,6 +8,7 @@ import logging
 import os
 from pathlib import Path
 import re
+from statistics import median
 import threading
 from typing import Any
 
@@ -47,9 +48,21 @@ THEME_FEATURE_SERVING_TABLES = {
     "trends": "serving.theme_trends_daily",
     "cross": "serving.theme_cross_daily",
 }
+THEME_FORECAST_SERVING_TABLES = {
+    "release": "serving.sales_forecast_release",
+    "coverage_current": "serving.sales_forecast_domain_coverage_current",
+    "item_current": "serving.item_market_sales_forecast_current",
+}
 API_KEY_HEADER_NAME = "X-API-Key"
 API_RESPONSE_SCHEMA = "xiamimate_theme_api_v1"
 PROTECTED_API_PREFIX = "/api/product-theme/"
+FORECAST_STATUS_READY = "ready"
+FORECAST_STATUS_PARTIAL_COVERAGE = "partial_coverage"
+FORECAST_STATUS_MISSING_DOMAIN_MODEL = "missing_domain_model"
+FORECAST_STATUS_MISSING_ASIN_PREDICTION = "missing_asin_prediction"
+FORECAST_STATUS_UNAVAILABLE = "unavailable"
+FORECAST_HIGH_GROWTH_RATIO_THRESHOLD = 2.0
+FORECAST_TOP_ASINS_LIMIT = 5
 
 MARKETPLACE_TO_DOMAIN = {
     "US": 1,
@@ -91,6 +104,7 @@ TOKEN_ALIAS_EXPANSIONS = {
 
 load_env_file_if_present(ROOT_ENV_FILE)
 QUERY_ASSISTANT = ProductRecallQueryAssistant(env_prefix="THEME_QUERY_NORMALIZER")
+LOGGER = logging.getLogger(__name__)
 
 
 class ResolveCandidatesRequest(BaseModel):
@@ -409,6 +423,15 @@ def _run_pg_dict_query(conn, sql: str, params: list[Any] | None = None) -> list[
         return [dict(row) for row in cursor.fetchall()]
 
 
+def _iso_date_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    text = str(value).strip()
+    return text or None
+
+
 def _get_theme_feature_serving_status(include_data_max_date: bool = True) -> dict[str, Any]:
     with _postgres_conn() as conn:
         registry_row = _run_pg_dict_query(
@@ -641,6 +664,319 @@ def _keepa_stats_price(stats: dict, key: str, index: int, is_yen: bool) -> float
 
 
 class ProductThemeService:
+    def _build_forecast_meta(self, coverage_row: dict[str, Any] | None = None) -> dict[str, Any]:
+        coverage_row = coverage_row or {}
+        return {
+            "forecast_version": coverage_row.get("forecast_version"),
+            "snapshot_date": _iso_date_or_none(coverage_row.get("snapshot_date")),
+            "forecast_week_start": _iso_date_or_none(coverage_row.get("forecast_week_start")),
+            "forecast_year_week": coverage_row.get("forecast_year_week"),
+        }
+
+    def _build_candidate_pool_sales_forecast_empty(
+        self,
+        *,
+        status: str,
+        candidate_asin_count: int,
+        coverage_row: dict[str, Any] | None = None,
+        notes: list[str] | None = None,
+    ) -> dict[str, Any]:
+        payload = self._build_forecast_meta(coverage_row)
+        payload.update(
+            {
+                "status": status,
+                "candidate_asin_count": candidate_asin_count,
+                "covered_asin_count": 0,
+                "missing_asin_count": candidate_asin_count,
+                "coverage_ratio": 0.0,
+                "high_growth_ratio_threshold": FORECAST_HIGH_GROWTH_RATIO_THRESHOLD,
+                "predicted_sales_w4_total": None,
+                "predicted_sales_w1_median": None,
+                "high_growth_item_ratio": None,
+                "top20_predicted_sales_w4_share": None,
+                "predicted_top_asins_w4": [],
+                "notes": notes or [],
+            }
+        )
+        return payload
+
+    def _build_item_sales_forecast_empty(
+        self,
+        *,
+        status: str,
+        coverage_row: dict[str, Any] | None = None,
+        notes: list[str] | None = None,
+    ) -> dict[str, Any]:
+        payload = self._build_forecast_meta(coverage_row)
+        payload.update(
+            {
+                "status": status,
+                "predicted_weekly_sales_w1": None,
+                "predicted_weekly_sales_w4": None,
+                "predicted_growth_ratio_w4_over_w1": None,
+                "predicted_growth_delta_w4_minus_w1": None,
+                "predicted_rank_w1_within_domain": None,
+                "predicted_rank_w4_within_domain": None,
+                "model_config_name_w1": coverage_row.get("model_config_name_w1") if coverage_row else None,
+                "model_config_name_w4": coverage_row.get("model_config_name_w4") if coverage_row else None,
+                "notes": notes or [],
+            }
+        )
+        return payload
+
+    def _fetch_sales_forecast_domain_coverage(self, conn, domain: int) -> dict[str, Any] | None:
+        rows = _run_pg_dict_query(
+            conn,
+            f"""
+            SELECT
+                domain,
+                forecast_version,
+                snapshot_date,
+                coverage_status,
+                forecast_week_start,
+                forecast_year_week,
+                model_config_name_w1,
+                model_config_name_w4,
+                test_rmse_w1,
+                test_rmse_w4,
+                test_r2_w1,
+                test_r2_w4
+            FROM {THEME_FORECAST_SERVING_TABLES['coverage_current']}
+            WHERE domain = %s
+            LIMIT 1
+            """,
+            [domain],
+        )
+        return rows[0] if rows else None
+
+    def _fetch_sales_forecast_items(self, conn, domain: int, candidate_asins: list[str]) -> dict[str, dict[str, Any]]:
+        rows = _run_pg_dict_query(
+            conn,
+            f"""
+            SELECT
+                domain,
+                asin,
+                forecast_version,
+                snapshot_date,
+                forecast_week_start,
+                forecast_year_week,
+                predicted_weekly_sales_w1,
+                predicted_weekly_sales_w4,
+                predicted_growth_ratio_w4_over_w1,
+                predicted_growth_delta_w4_minus_w1,
+                predicted_rank_w1_within_domain,
+                predicted_rank_w4_within_domain,
+                model_config_name_w1,
+                model_config_name_w4,
+                test_rmse_w1,
+                test_rmse_w4,
+                test_mae_w1,
+                test_mae_w4,
+                test_mape_w1,
+                test_mape_w4,
+                test_smape_w1,
+                test_smape_w4,
+                test_r2_w1,
+                test_r2_w4
+            FROM {THEME_FORECAST_SERVING_TABLES['item_current']}
+            WHERE domain = %s
+              AND asin = ANY(%s)
+            """,
+            [domain, candidate_asins],
+        )
+        return {str(row["asin"]): row for row in rows}
+
+    def _get_sales_forecast_context(self, conn, domain: int, candidate_asins: list[str]) -> dict[str, Any]:
+        coverage_row = self._fetch_sales_forecast_domain_coverage(conn, domain)
+        if not coverage_row:
+            return {
+                "status": FORECAST_STATUS_MISSING_DOMAIN_MODEL,
+                "coverage_row": None,
+                "items_by_asin": {},
+            }
+
+        coverage_status = str(coverage_row.get("coverage_status") or "").strip()
+        if coverage_status == FORECAST_STATUS_MISSING_DOMAIN_MODEL:
+            return {
+                "status": FORECAST_STATUS_MISSING_DOMAIN_MODEL,
+                "coverage_row": coverage_row,
+                "items_by_asin": {},
+            }
+
+        if coverage_status != "covered":
+            return {
+                "status": FORECAST_STATUS_UNAVAILABLE,
+                "coverage_row": coverage_row,
+                "items_by_asin": {},
+            }
+
+        items_by_asin = self._fetch_sales_forecast_items(conn, domain, candidate_asins)
+        return {
+            "status": "covered",
+            "coverage_row": coverage_row,
+            "items_by_asin": items_by_asin,
+        }
+
+    def _build_candidate_pool_sales_forecast(self, conn, domain: int, candidate_asins: list[str]) -> dict[str, Any]:
+        try:
+            forecast_context = self._get_sales_forecast_context(conn, domain, candidate_asins)
+        except Exception as exc:
+            LOGGER.warning("sales forecast lookup unavailable for candidate_pool_stats domain=%s: %s", domain, exc)
+            return self._build_candidate_pool_sales_forecast_empty(
+                status=FORECAST_STATUS_UNAVAILABLE,
+                candidate_asin_count=len(candidate_asins),
+                notes=["sales forecast serving unavailable; base candidate pool stats returned without forecast merge"],
+            )
+
+        coverage_row = forecast_context["coverage_row"]
+        if forecast_context["status"] == FORECAST_STATUS_MISSING_DOMAIN_MODEL:
+            return self._build_candidate_pool_sales_forecast_empty(
+                status=FORECAST_STATUS_MISSING_DOMAIN_MODEL,
+                candidate_asin_count=len(candidate_asins),
+                coverage_row=coverage_row,
+                notes=["current domain does not have an active forecast model"],
+            )
+
+        if forecast_context["status"] == FORECAST_STATUS_UNAVAILABLE:
+            return self._build_candidate_pool_sales_forecast_empty(
+                status=FORECAST_STATUS_UNAVAILABLE,
+                candidate_asin_count=len(candidate_asins),
+                coverage_row=coverage_row,
+                notes=["sales forecast serving returned an unsupported coverage status"],
+            )
+
+        items_by_asin = forecast_context["items_by_asin"]
+        covered_rows = [items_by_asin[asin] for asin in candidate_asins if asin in items_by_asin]
+        candidate_asin_count = len(candidate_asins)
+        covered_asin_count = len(covered_rows)
+        missing_asin_count = candidate_asin_count - covered_asin_count
+        status = FORECAST_STATUS_READY if missing_asin_count == 0 else FORECAST_STATUS_PARTIAL_COVERAGE
+
+        predicted_sales_w4_values = [
+            float(row["predicted_weekly_sales_w4"])
+            for row in covered_rows
+            if row.get("predicted_weekly_sales_w4") is not None
+        ]
+        predicted_sales_w1_values = [
+            float(row["predicted_weekly_sales_w1"])
+            for row in covered_rows
+            if row.get("predicted_weekly_sales_w1") is not None
+        ]
+        growth_ratio_values = [
+            float(row["predicted_growth_ratio_w4_over_w1"])
+            for row in covered_rows
+            if row.get("predicted_growth_ratio_w4_over_w1") is not None
+        ]
+        predicted_top_rows = sorted(
+            covered_rows,
+            key=lambda row: float(row.get("predicted_weekly_sales_w4") or float("-inf")),
+            reverse=True,
+        )
+
+        total_w4 = sum(predicted_sales_w4_values) if predicted_sales_w4_values else None
+        top20_w4 = sum(predicted_sales_w4_values[:20]) if predicted_sales_w4_values else None
+        payload = self._build_forecast_meta(coverage_row)
+        payload.update(
+            {
+                "status": status,
+                "candidate_asin_count": candidate_asin_count,
+                "covered_asin_count": covered_asin_count,
+                "missing_asin_count": missing_asin_count,
+                "coverage_ratio": round(covered_asin_count / candidate_asin_count, 4) if candidate_asin_count else 0.0,
+                "high_growth_ratio_threshold": FORECAST_HIGH_GROWTH_RATIO_THRESHOLD,
+                "predicted_sales_w4_total": round(total_w4, 2) if total_w4 is not None else None,
+                "predicted_sales_w1_median": round(float(median(predicted_sales_w1_values)), 2) if predicted_sales_w1_values else None,
+                "high_growth_item_ratio": (
+                    round(
+                        sum(1 for value in growth_ratio_values if value >= FORECAST_HIGH_GROWTH_RATIO_THRESHOLD)
+                        / len(growth_ratio_values),
+                        4,
+                    )
+                    if growth_ratio_values
+                    else None
+                ),
+                "top20_predicted_sales_w4_share": (
+                    round(top20_w4 / total_w4, 4)
+                    if total_w4 not in (None, 0.0) and top20_w4 is not None
+                    else None
+                ),
+                "predicted_top_asins_w4": [
+                    {
+                        "asin": str(row["asin"]),
+                        "predicted_weekly_sales_w4": round(float(row["predicted_weekly_sales_w4"]), 2)
+                        if row.get("predicted_weekly_sales_w4") is not None
+                        else None,
+                        "predicted_growth_delta_w4_minus_w1": round(float(row["predicted_growth_delta_w4_minus_w1"]), 2)
+                        if row.get("predicted_growth_delta_w4_minus_w1") is not None
+                        else None,
+                        "predicted_rank_w4_within_domain": int(row["predicted_rank_w4_within_domain"])
+                        if row.get("predicted_rank_w4_within_domain") is not None
+                        else None,
+                    }
+                    for row in predicted_top_rows[:FORECAST_TOP_ASINS_LIMIT]
+                ],
+                "notes": (
+                    ["forecast summary covers only matched ASINs in the current release"]
+                    if status == FORECAST_STATUS_PARTIAL_COVERAGE
+                    else []
+                ),
+            }
+        )
+        return payload
+
+    def _build_top_asin_sales_forecast_payload(self, conn, domain: int, candidate_asins: list[str]) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        try:
+            forecast_context = self._get_sales_forecast_context(conn, domain, candidate_asins)
+        except Exception as exc:
+            LOGGER.warning("sales forecast lookup unavailable for top_asin_drilldown domain=%s: %s", domain, exc)
+            return (
+                {
+                    "status": FORECAST_STATUS_UNAVAILABLE,
+                    "forecast_version": None,
+                    "snapshot_date": None,
+                    "forecast_week_start": None,
+                    "forecast_year_week": None,
+                    "notes": ["sales forecast serving unavailable; drilldown returned without forecast enrichment"],
+                },
+                {},
+            )
+
+        coverage_row = forecast_context["coverage_row"]
+        if forecast_context["status"] == FORECAST_STATUS_MISSING_DOMAIN_MODEL:
+            meta = self._build_forecast_meta(coverage_row)
+            meta.update(
+                {
+                    "status": FORECAST_STATUS_MISSING_DOMAIN_MODEL,
+                    "notes": ["current domain does not have an active forecast model"],
+                }
+            )
+            return meta, {}
+
+        if forecast_context["status"] == FORECAST_STATUS_UNAVAILABLE:
+            meta = self._build_forecast_meta(coverage_row)
+            meta.update(
+                {
+                    "status": FORECAST_STATUS_UNAVAILABLE,
+                    "notes": ["sales forecast serving returned an unsupported coverage status"],
+                }
+            )
+            return meta, {}
+
+        items_by_asin = forecast_context["items_by_asin"]
+        matched_count = sum(1 for asin in candidate_asins if asin in items_by_asin)
+        meta = self._build_forecast_meta(coverage_row)
+        meta.update(
+            {
+                "status": FORECAST_STATUS_READY if matched_count == len(candidate_asins) else FORECAST_STATUS_PARTIAL_COVERAGE,
+                "notes": (
+                    ["some drilldown ASINs are not included in the current forecast release"]
+                    if matched_count != len(candidate_asins)
+                    else []
+                ),
+            }
+        )
+        return meta, items_by_asin
+
     def _fetch_domain_candidates(self, domain: int) -> list[dict[str, Any]]:
         """Fetch all registry rows for a domain from PostgreSQL serving tables."""
         with _postgres_conn() as conn:
@@ -1013,6 +1349,7 @@ class ProductThemeService:
                 """,
                 [domain, domain, candidate_asins, effective_window_days - 1],
             )
+            sales_forecast = self._build_candidate_pool_sales_forecast(conn, domain, candidate_asins)
 
         top_brand_list = [{"name": r["name"], "count": r["count"]} for r in top_brand_rows if r["agg_type"] == "brand"]
         top_category_list = [{"name": r["name"], "count": r["count"]} for r in top_brand_rows if r["agg_type"] == "category"]
@@ -1044,6 +1381,7 @@ class ProductThemeService:
             "top_brands": top_brand_list,
             "top_categories": top_category_list,
             "data_max_date": stats.get("max_date"),
+            "sales_forecast": sales_forecast,
         }
 
     def get_candidate_pool_trends(self, request: CandidatePoolRequest) -> dict[str, Any]:
@@ -1387,12 +1725,71 @@ class ProductThemeService:
                 """,
                 [domain, domain, candidate_asins, effective_window_days - 1],
             )
+            sales_forecast_meta, forecast_items_by_asin = self._build_top_asin_sales_forecast_payload(
+                conn,
+                domain,
+                candidate_asins,
+            )
+
+        enriched_rows: list[dict[str, Any]] = []
+        for row in rows:
+            enriched_row = dict(row)
+            asin = str(enriched_row.get("asin") or "")
+            forecast_row = forecast_items_by_asin.get(asin)
+            if forecast_row:
+                sales_forecast = self._build_forecast_meta(forecast_row)
+                sales_forecast.update(
+                    {
+                        "status": FORECAST_STATUS_READY,
+                        "predicted_weekly_sales_w1": round(float(forecast_row["predicted_weekly_sales_w1"]), 2)
+                        if forecast_row.get("predicted_weekly_sales_w1") is not None
+                        else None,
+                        "predicted_weekly_sales_w4": round(float(forecast_row["predicted_weekly_sales_w4"]), 2)
+                        if forecast_row.get("predicted_weekly_sales_w4") is not None
+                        else None,
+                        "predicted_growth_ratio_w4_over_w1": round(float(forecast_row["predicted_growth_ratio_w4_over_w1"]), 4)
+                        if forecast_row.get("predicted_growth_ratio_w4_over_w1") is not None
+                        else None,
+                        "predicted_growth_delta_w4_minus_w1": round(float(forecast_row["predicted_growth_delta_w4_minus_w1"]), 2)
+                        if forecast_row.get("predicted_growth_delta_w4_minus_w1") is not None
+                        else None,
+                        "predicted_rank_w1_within_domain": int(forecast_row["predicted_rank_w1_within_domain"])
+                        if forecast_row.get("predicted_rank_w1_within_domain") is not None
+                        else None,
+                        "predicted_rank_w4_within_domain": int(forecast_row["predicted_rank_w4_within_domain"])
+                        if forecast_row.get("predicted_rank_w4_within_domain") is not None
+                        else None,
+                        "model_config_name_w1": forecast_row.get("model_config_name_w1"),
+                        "model_config_name_w4": forecast_row.get("model_config_name_w4"),
+                        "notes": [],
+                    }
+                )
+            elif sales_forecast_meta["status"] == FORECAST_STATUS_MISSING_DOMAIN_MODEL:
+                sales_forecast = self._build_item_sales_forecast_empty(
+                    status=FORECAST_STATUS_MISSING_DOMAIN_MODEL,
+                    notes=sales_forecast_meta.get("notes"),
+                )
+            elif sales_forecast_meta["status"] == FORECAST_STATUS_UNAVAILABLE:
+                sales_forecast = self._build_item_sales_forecast_empty(
+                    status=FORECAST_STATUS_UNAVAILABLE,
+                    notes=sales_forecast_meta.get("notes"),
+                )
+            else:
+                sales_forecast = self._build_item_sales_forecast_empty(
+                    status=FORECAST_STATUS_MISSING_ASIN_PREDICTION,
+                    coverage_row=sales_forecast_meta,
+                    notes=["current domain has forecast coverage, but this ASIN is not in the current release"],
+                )
+
+            enriched_row["sales_forecast"] = sales_forecast
+            enriched_rows.append(enriched_row)
 
         return {
             "marketplace": marketplace,
             "domain": domain,
             "window_days": effective_window_days,
-            "items": rows,
+            "sales_forecast_meta": sales_forecast_meta,
+            "items": enriched_rows,
         }
 
     def get_category_benchmark(self, request: CandidatePoolRequest) -> dict[str, Any]:
