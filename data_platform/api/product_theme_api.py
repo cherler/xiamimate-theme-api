@@ -140,6 +140,34 @@ class DrilldownRequest(CandidatePoolRequest):
     top_n: int | None = Field(default=None, ge=1, le=20)
 
 
+class AsinHistoryTimeseriesRequest(BaseModel):
+    asins: list[str] = Field(..., min_length=1)
+    marketplace: str | int = "US"
+    window_days: int = Field(default=90, ge=7, le=90)
+    interval: str = Field(default="day")
+    metrics: list[str] = Field(default_factory=list)
+    include_latest_snapshot: bool = True
+    include_window_summary: bool = True
+    source_preference: str = "local_first"
+    fallback_keepa_snapshot: bool = True
+
+    @validator("asins", "metrics", pre=True, always=True)
+    def _accept_csv_string(cls, v: Any) -> list[str]:  # noqa: N805
+        if isinstance(v, str):
+            return [s.strip() for s in v.split(",") if s.strip()]
+        if v is None:
+            return []
+        return v
+
+    @validator("interval")
+    def _validate_interval(cls, v: str) -> str:  # noqa: N805
+        allowed = {"day", "week"}
+        value = (v or "day").strip().lower()
+        if value not in allowed:
+            raise ValueError("interval must be one of: day, week")
+        return value
+
+
 class KeepaAsinLookupRequest(BaseModel):
     asins: list[str] = Field(..., min_length=1)
     marketplace: str | int = "US"
@@ -1891,6 +1919,322 @@ class ProductThemeService:
             "items": enriched_rows,
         }
 
+    def get_asin_history_timeseries(self, request: AsinHistoryTimeseriesRequest) -> dict[str, Any]:
+        domain, marketplace = _normalize_marketplace(request.marketplace)
+        asins = _sanitize_asins(request.asins)
+        if not asins:
+            raise HTTPException(status_code=400, detail="no valid ASINs provided")
+
+        effective_window_days = min(request.window_days, 90)
+        metrics = self._normalize_asin_history_metrics(request.metrics)
+        with _postgres_conn() as conn:
+            rows = self._fetch_asin_history_daily_rows(conn, domain, asins, effective_window_days)
+
+        rows_by_asin: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            asin = str(row.get("asin") or "").strip()
+            if not asin:
+                continue
+            rows_by_asin.setdefault(asin, []).append(row)
+
+        missing_asins = [asin for asin in asins if asin not in rows_by_asin]
+        keepa_snapshot_map: dict[str, dict[str, Any]] = {}
+        if request.fallback_keepa_snapshot and missing_asins:
+            keepa_snapshot_map = self._fallback_keepa_snapshot_for_missing_asins(missing_asins, marketplace)
+
+        truncated_keepa_fallback = False
+        if request.fallback_keepa_snapshot and len(missing_asins) > 20:
+            truncated_keepa_fallback = True
+
+        items = self._build_asin_history_items(
+            rows=rows,
+            asins=asins,
+            interval=request.interval,
+            metrics=metrics,
+            window_days=effective_window_days,
+            include_latest_snapshot=request.include_latest_snapshot,
+            include_window_summary=request.include_window_summary,
+            keepa_snapshot_map=keepa_snapshot_map,
+        )
+
+        notes: list[str] = []
+        if request.interval == "week":
+            notes.append("week interval is aggregated in Python from local daily rows")
+        if missing_asins and not request.fallback_keepa_snapshot:
+            notes.append("some ASINs have no local history and keepa fallback is disabled")
+        elif keepa_snapshot_map:
+            notes.append("missing local history ASINs use Keepa latest snapshot as fallback")
+        if truncated_keepa_fallback:
+            notes.append("Keepa fallback currently caps missing ASIN lookups to the first 20 ASINs")
+
+        return {
+            "marketplace": marketplace,
+            "domain": domain,
+            "window_days": effective_window_days,
+            "interval": request.interval,
+            "metrics": metrics,
+            "source_preference": request.source_preference,
+            "requested_asin_count": len(asins),
+            "local_history_hit_count": len(asins) - len(missing_asins),
+            "missing_local_history_asin_count": len(missing_asins),
+            "fallback_keepa_snapshot": request.fallback_keepa_snapshot,
+            "items": items,
+            "notes": notes,
+        }
+
+    def _normalize_asin_history_metrics(self, metrics: list[str]) -> list[str]:
+        allowed = {
+            "effective_price",
+            "rating",
+            "review_count",
+            "offer_count",
+            "bsr",
+            "estimated_daily_sales",
+        }
+        normalized: list[str] = []
+        for metric in metrics or []:
+            value = str(metric or "").strip().lower()
+            if value in allowed and value not in normalized:
+                normalized.append(value)
+        if normalized:
+            return normalized
+        return ["estimated_daily_sales", "effective_price", "bsr", "review_count"]
+
+    def _fetch_asin_history_daily_rows(self, conn, domain: int, asins: list[str], window_days: int) -> list[dict[str, Any]]:
+        if not asins:
+            return []
+        return _run_pg_dict_query(
+            conn,
+            """
+            WITH max_date AS (
+                SELECT MAX(date) AS max_date
+                FROM serving.theme_base_daily
+                WHERE domain = %s
+            ),
+            filtered AS (
+                SELECT
+                    asin,
+                    domain,
+                    product_title,
+                    brand,
+                    category,
+                    effective_price,
+                    rating,
+                    review_count,
+                    COALESCE(new_offer_count, 0) + COALESCE(used_offer_count, 0) AS offer_count,
+                    bsr,
+                    estimated_daily_sales,
+                    date
+                FROM serving.theme_base_daily
+                WHERE domain = %s
+                  AND asin = ANY(%s)
+                  AND date >= (
+                      SELECT max_date - (%s * INTERVAL '1 day')
+                      FROM max_date
+                  )
+            )
+            SELECT
+                asin,
+                product_title,
+                brand,
+                category,
+                effective_price,
+                rating,
+                review_count,
+                offer_count,
+                bsr,
+                estimated_daily_sales,
+                date
+            FROM filtered
+            ORDER BY asin, date ASC
+            """,
+            [domain, domain, asins, window_days - 1],
+        )
+
+    def _build_asin_history_items(
+        self,
+        rows: list[dict[str, Any]],
+        asins: list[str],
+        interval: str,
+        metrics: list[str],
+        window_days: int,
+        include_latest_snapshot: bool,
+        include_window_summary: bool,
+        keepa_snapshot_map: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        rows_by_asin: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            asin = str(row.get("asin") or "").strip()
+            if not asin:
+                continue
+            rows_by_asin.setdefault(asin, []).append(row)
+
+        items: list[dict[str, Any]] = []
+        for asin in asins:
+            asin_rows = rows_by_asin.get(asin) or []
+            if not asin_rows:
+                item: dict[str, Any] = {
+                    "asin": asin,
+                    "history_status": "no_local_history",
+                    "series": [],
+                }
+                if include_latest_snapshot:
+                    item["latest_snapshot"] = keepa_snapshot_map.get(asin)
+                if include_window_summary:
+                    item["window_summary"] = None
+                if asin in keepa_snapshot_map:
+                    item["notes"] = ["latest snapshot is from Keepa fallback because no local history was found"]
+                items.append(item)
+                continue
+
+            series_rows = asin_rows
+            if interval == "week":
+                series_rows = self._group_asin_history_weekly(asin_rows)
+
+            item = {
+                "asin": asin,
+                "history_status": "ready",
+                "series": [self._build_asin_history_series_row(row, metrics, interval) for row in series_rows],
+            }
+            if include_latest_snapshot:
+                item["latest_snapshot"] = self._build_asin_history_latest_snapshot(asin_rows[-1])
+            if include_window_summary:
+                item["window_summary"] = self._build_asin_history_window_summary(asin_rows, interval, window_days)
+            items.append(item)
+        return items
+
+    def _group_asin_history_weekly(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        grouped: dict[tuple[str, int, int], list[dict[str, Any]]] = {}
+        for row in rows:
+            asin = str(row.get("asin") or "").strip()
+            row_date = row.get("date")
+            if not asin or row_date is None or not hasattr(row_date, "isocalendar"):
+                continue
+            iso_year, iso_week, _iso_weekday = row_date.isocalendar()
+            grouped.setdefault((asin, iso_year, iso_week), []).append(row)
+
+        weekly_rows: list[dict[str, Any]] = []
+        for (_asin, iso_year, iso_week), bucket in grouped.items():
+            ordered_bucket = sorted(bucket, key=lambda item: item.get("date"))
+            latest_row = ordered_bucket[-1]
+
+            def _avg(field_name: str) -> float | None:
+                values = [float(item[field_name]) for item in ordered_bucket if item.get(field_name) is not None]
+                if not values:
+                    return None
+                return round(sum(values) / len(values), 2)
+
+            weekly_rows.append(
+                {
+                    "asin": latest_row.get("asin"),
+                    "product_title": latest_row.get("product_title"),
+                    "brand": latest_row.get("brand"),
+                    "category": latest_row.get("category"),
+                    "effective_price": latest_row.get("effective_price"),
+                    "rating": latest_row.get("rating"),
+                    "review_count": latest_row.get("review_count"),
+                    "offer_count": _avg("offer_count"),
+                    "bsr": _avg("bsr"),
+                    "estimated_daily_sales": _avg("estimated_daily_sales"),
+                    "date": latest_row.get("date"),
+                    "iso_year_week": "%04d-W%02d" % (iso_year, iso_week),
+                }
+            )
+
+        weekly_rows.sort(key=lambda item: (str(item.get("asin") or ""), item.get("date") or datetime.min.date()))
+        return weekly_rows
+
+    def _fallback_keepa_snapshot_for_missing_asins(self, asins: list[str], marketplace: str | int) -> dict[str, dict[str, Any]]:
+        missing = _sanitize_asins(asins)
+        if not missing:
+            return {}
+        capped_asins = missing[:20]
+        payload = self.keepa_asin_lookup(KeepaAsinLookupRequest(asins=capped_asins, marketplace=marketplace))
+        items = payload.get("items") if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            return {}
+        return {
+            str(item.get("asin") or "").strip(): {
+                "asin": item.get("asin"),
+                "product_title": item.get("product_title"),
+                "brand": item.get("brand"),
+                "category": item.get("category"),
+                "effective_price": item.get("effective_price"),
+                "rating": item.get("rating"),
+                "review_count": item.get("review_count"),
+                "offer_count": item.get("offer_count"),
+                "bsr": item.get("bsr"),
+                "estimated_daily_sales": item.get("estimated_daily_sales"),
+                "latest_date": item.get("latest_date"),
+                "source": "keepa_api",
+            }
+            for item in items
+            if str(item.get("asin") or "").strip()
+        }
+
+    def _build_asin_history_series_row(self, row: dict[str, Any], metrics: list[str], interval: str) -> dict[str, Any]:
+        series_row = {
+            "asin": row.get("asin"),
+            "date": self._format_asin_history_date(row.get("date")),
+        }
+        if interval == "week" and row.get("iso_year_week"):
+            series_row["iso_year_week"] = row.get("iso_year_week")
+        for metric in metrics:
+            series_row[metric] = row.get(metric)
+        return series_row
+
+    def _build_asin_history_latest_snapshot(self, row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "asin": row.get("asin"),
+            "product_title": row.get("product_title"),
+            "brand": row.get("brand"),
+            "category": row.get("category"),
+            "effective_price": row.get("effective_price"),
+            "rating": row.get("rating"),
+            "review_count": row.get("review_count"),
+            "offer_count": row.get("offer_count"),
+            "bsr": row.get("bsr"),
+            "estimated_daily_sales": row.get("estimated_daily_sales"),
+            "latest_date": self._format_asin_history_date(row.get("date")),
+            "source": "local_theme_base_daily",
+        }
+
+    def _build_asin_history_window_summary(self, rows: list[dict[str, Any]], interval: str, window_days: int) -> dict[str, Any] | None:
+        if not rows:
+            return None
+
+        sales_values = [float(row["estimated_daily_sales"]) for row in rows if row.get("estimated_daily_sales") is not None]
+        price_values = [float(row["effective_price"]) for row in rows if row.get("effective_price") is not None]
+        offer_values = [float(row["offer_count"]) for row in rows if row.get("offer_count") is not None]
+        bsr_values = [float(row["bsr"]) for row in rows if row.get("bsr") is not None]
+        first_review = next((row.get("review_count") for row in rows if row.get("review_count") is not None), None)
+        last_review = next((row.get("review_count") for row in reversed(rows) if row.get("review_count") is not None), None)
+        expected_rows = window_days if interval == "day" else max(1, (window_days + 6) // 7)
+        if interval == "week":
+            grouped_rows = self._group_asin_history_weekly(rows)
+            series_row_count = len(grouped_rows)
+        else:
+            series_row_count = len(rows)
+
+        return {
+            "sales_window_sum": round(sum(sales_values), 2) if sales_values else None,
+            "sales_daily_avg": round(sum(sales_values) / len(sales_values), 2) if sales_values else None,
+            "price_min_window": round(min(price_values), 2) if price_values else None,
+            "price_max_window": round(max(price_values), 2) if price_values else None,
+            "review_growth_window": int(last_review) - int(first_review) if last_review is not None and first_review is not None else None,
+            "offer_count_avg_window": round(sum(offer_values) / len(offer_values), 2) if offer_values else None,
+            "bsr_avg_window": round(sum(bsr_values) / len(bsr_values), 2) if bsr_values else None,
+            "series_row_count": series_row_count,
+            "coverage_ratio": round(min(len(rows) / float(max(expected_rows, 1)), 1.0), 4),
+        }
+
+    def _format_asin_history_date(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        if hasattr(value, "strftime"):
+            return value.strftime("%Y-%m-%d")
+        return str(value)
+
     def get_category_benchmark(self, request: CandidatePoolRequest) -> dict[str, Any]:
         """Return L3-level category benchmark stats for comparison with candidate pool.
 
@@ -2457,6 +2801,15 @@ def top_asin_drilldown(request: DrilldownRequest) -> dict[str, Any]:
         endpoint="/api/product-theme/top-asin-drilldown",
         message="top asin drilldown ready",
         data=service.get_top_asin_drilldown(request),
+    )
+
+
+@app.post("/api/product-theme/asin-history-timeseries")
+def asin_history_timeseries(request: AsinHistoryTimeseriesRequest) -> dict[str, Any]:
+    return _success_response(
+        endpoint="/api/product-theme/asin-history-timeseries",
+        message="asin history timeseries loaded",
+        data=service.get_asin_history_timeseries(request),
     )
 
 
