@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 from statistics import median
 import threading
+import time
 from typing import Any
 
 import requests as http_requests
@@ -82,6 +83,35 @@ DOMAIN_TO_MARKETPLACE = {value: key for key, value in MARKETPLACE_TO_DOMAIN.item
 ASIN_PATTERN = re.compile(r"^[A-Z0-9]{8,16}$")
 ASCII_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 MIN_TOKEN_LENGTH = 2
+
+QUERY_MODIFIER_TOKENS = {
+    "adjustable",
+    "auto",
+    "automatic",
+    "battery",
+    "best",
+    "corded",
+    "cordless",
+    "digital",
+    "electric",
+    "for",
+    "high",
+    "large",
+    "mini",
+    "new",
+    "portable",
+    "pro",
+    "professional",
+    "rechargeable",
+    "replacement",
+    "small",
+    "smart",
+    "travel",
+    "usb",
+    "waterproof",
+    "wireless",
+    "with",
+}
 
 QUERY_ALIAS_EXPANSIONS = {
     "电子相框": ["digital photo frame", "digital picture frame", "wifi digital picture frame"],
@@ -332,6 +362,95 @@ def _tokenize_phrase(value: str) -> list[str]:
     return tokens
 
 
+def _category_path_parts(category_path: Any) -> list[str]:
+    return [part.strip() for part in str(category_path or "").split(" > ") if part.strip()]
+
+
+def _category_level_name(category_path: Any, index: int) -> str | None:
+    parts = _category_path_parts(category_path)
+    if 0 <= index < len(parts):
+        return parts[index]
+    return None
+
+
+def _leaf_category_name(category_path: Any, fallback_category: Any = None) -> str | None:
+    parts = _category_path_parts(category_path)
+    if parts:
+        return parts[-1]
+    fallback = str(fallback_category or "").strip()
+    return fallback or None
+
+
+def _fine_category_name(category_path: Any, fallback_category: Any = None) -> str | None:
+    return _leaf_category_name(category_path, fallback_category)
+
+
+def _category_distribution(items: list[dict[str, Any]], field_name: str, limit: int = 12) -> list[dict[str, Any]]:
+    counts: dict[str, int] = {}
+    for item in items:
+        value = str(item.get(field_name) or "").strip()
+        if not value:
+            value = "其他/未归类"
+        counts[value] = counts.get(value, 0) + 1
+    return [
+        {"category": category, "candidate_count": count}
+        for category, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:limit]
+    ]
+
+
+def _candidate_field_matches_required_terms(item: dict[str, Any], field_names: list[str], required_terms: list[str]) -> bool:
+    for field_name in field_names:
+        text = _normalize_text(str(item.get(field_name) or ""))
+        if any(_text_contains_token_variant(text, term) for term in required_terms):
+            return True
+    return False
+
+
+def _is_query_modifier_token(token: str) -> bool:
+    return _normalize_text(token) in QUERY_MODIFIER_TOKENS
+
+
+def _token_variants(token: str) -> set[str]:
+    normalized = _normalize_text(token)
+    if not normalized:
+        return set()
+    variants = {normalized}
+    if ASCII_TOKEN_PATTERN.fullmatch(normalized):
+        if normalized.endswith("ies") and len(normalized) > 3:
+            variants.add(normalized[:-3] + "y")
+        elif normalized.endswith("y") and len(normalized) > 2:
+            variants.add(normalized[:-1] + "ies")
+        if normalized.endswith("es") and len(normalized) > 3:
+            variants.add(normalized[:-2])
+        if normalized.endswith("s") and len(normalized) > 3:
+            variants.add(normalized[:-1])
+        else:
+            variants.add(normalized + "s")
+    return {variant for variant in variants if len(variant) >= MIN_TOKEN_LENGTH}
+
+
+def _text_contains_token_variant(text: str, token: str) -> bool:
+    return any(_text_contains_token(text, variant) for variant in _token_variants(token))
+
+
+def _build_required_product_terms(normalized_phrases: list[str], tokens: list[str], max_terms: int = 8) -> list[str]:
+    required_terms: list[str] = []
+    for phrase in normalized_phrases:
+        phrase_tokens = [token for token in _tokenize_phrase(phrase) if ASCII_TOKEN_PATTERN.fullmatch(token)]
+        if not phrase_tokens:
+            continue
+        product_tokens = [token for token in phrase_tokens if not _is_query_modifier_token(token)]
+        required_terms.append((product_tokens or phrase_tokens)[-1])
+
+    if not required_terms:
+        ascii_tokens = [token for token in tokens if ASCII_TOKEN_PATTERN.fullmatch(token)]
+        product_tokens = [token for token in ascii_tokens if not _is_query_modifier_token(token)]
+        if product_tokens or ascii_tokens:
+            required_terms.append((product_tokens or ascii_tokens)[-1])
+
+    return _unique_nonempty(required_terms)[:max_terms]
+
+
 def _expand_query_aliases(phrase_inputs: list[str], tokens: list[str]) -> list[str]:
     expansions: list[str] = []
     seen: set[str] = set()
@@ -561,16 +680,36 @@ def _text_contains_token(text: str, token: str) -> bool:
     return token in text
 
 
+def _escape_sql_like_term(value: str) -> str:
+    return str(value or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _build_sql_prefilter_terms(normalized_phrases: list[str], tokens: list[str], max_terms: int = 40) -> list[str]:
+    terms: list[str] = []
+    for value in normalized_phrases + tokens:
+        normalized = _normalize_text(value)
+        if not normalized or len(normalized) < MIN_TOKEN_LENGTH:
+            continue
+        terms.append(_escape_sql_like_term(normalized))
+    return _unique_nonempty(terms)[:max_terms]
+
+
+def _candidate_sql_prefilter_limit(max_candidates: int) -> int:
+    requested = max(1, int(max_candidates or 1))
+    return min(5000, max(500, requested * 25))
+
+
 def _score_candidate(
     record: CandidateRecord,
     normalized_phrases: list[str],
     tokens: list[str],
-) -> tuple[float, list[str], dict[str, float]]:
+) -> tuple[float, list[str], dict[str, Any]]:
     title = _normalize_text(record.product_title)
     category = _normalize_text(record.category)
     category_path = _normalize_text(record.category_path)
     search_term = _normalize_text(record.search_term)
     keywords = [_normalize_text(keyword) for keyword in record.keywords if keyword]
+    required_product_terms = _build_required_product_terms(normalized_phrases, tokens)
 
     phrase_score = 0.0
     token_score = 0.0
@@ -620,6 +759,31 @@ def _score_candidate(
         if token_hit:
             matched_tokens += 1
 
+    high_signal_texts = [title, category, category_path] + keywords
+    semantic_field_texts = [category, category_path] + keywords
+    has_compound_phrase_match = any(
+        phrase
+        and len(_tokenize_phrase(phrase)) >= 2
+        and any(phrase in text for text in high_signal_texts + [search_term])
+        for phrase in normalized_phrases
+    )
+    matched_required_product_terms = [
+        term
+        for term in required_product_terms
+        if any(_text_contains_token_variant(text, term) for text in high_signal_texts)
+    ]
+    semantic_field_required_product_terms = [
+        term
+        for term in required_product_terms
+        if any(_text_contains_token_variant(text, term) for text in semantic_field_texts)
+    ]
+    if matched_required_product_terms:
+        reasons.add("required_product_term_match")
+    if semantic_field_required_product_terms:
+        reasons.add("required_product_term_semantic_field_match")
+    if has_compound_phrase_match:
+        reasons.add("compound_phrase_match")
+
     if tokens and matched_tokens == len(tokens):
         token_score += 18
         reasons.add("all_tokens_covered")
@@ -634,6 +798,14 @@ def _score_candidate(
     total_score = phrase_score + token_score + business_score + freshness_score + completeness_score
     minimum_token_hits = 1 if len(tokens) <= 1 else min(2, len(tokens))
     has_phrase_match = phrase_score > 0
+    required_product_term_coverage = (
+        round(len(matched_required_product_terms) / len(required_product_terms), 4) if required_product_terms else None
+    )
+    matched_token_ratio = round(matched_tokens / len(tokens), 4) if tokens else None
+    if required_product_terms and not matched_required_product_terms:
+        total_score = 0.0
+    if len(tokens) >= 2 and required_product_terms and not semantic_field_required_product_terms and not has_compound_phrase_match:
+        total_score = 0.0
     if tokens and not has_phrase_match and matched_tokens < minimum_token_hits:
         total_score = 0.0
     if not normalized_phrases and not tokens:
@@ -647,6 +819,14 @@ def _score_candidate(
         "business_score": round(business_score, 2),
         "freshness_score": round(freshness_score, 2),
         "completeness_score": round(completeness_score, 2),
+        "query_token_count": len(tokens),
+        "matched_query_token_count": matched_tokens,
+        "matched_query_token_ratio": matched_token_ratio,
+        "required_product_terms": required_product_terms,
+        "matched_required_product_terms": matched_required_product_terms,
+        "semantic_field_required_product_terms": semantic_field_required_product_terms,
+        "required_product_term_coverage": required_product_term_coverage,
+        "compound_phrase_match": has_compound_phrase_match,
     }
     return total_score, sorted(reasons), breakdown
 
@@ -1103,85 +1283,235 @@ class ProductThemeService:
         )
         return meta, items_by_asin
 
-    def _fetch_domain_candidates(self, domain: int) -> list[dict[str, Any]]:
-        """Fetch all registry rows for a domain from PostgreSQL serving tables."""
+    def _fetch_domain_candidates(
+        self,
+        domain: int,
+        *,
+        sql_prefilter_terms: list[str],
+        sql_required_product_terms: list[str],
+        active_only: bool,
+        price_min: float | None,
+        price_max: float | None,
+        prefilter_limit: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch query-matching registry rows for a domain from PostgreSQL serving tables."""
         with _postgres_conn() as conn:
             return _run_pg_dict_query(
                 conn,
                 """
-                WITH history_flags AS (
+                WITH query_terms AS MATERIALIZED (
+                    SELECT COALESCE(%s::TEXT[], ARRAY[]::TEXT[]) AS terms
+                ),
+                required_product_terms AS MATERIALIZED (
+                    SELECT COALESCE(%s::TEXT[], ARRAY[]::TEXT[]) AS terms
+                ),
+                matched_registry AS MATERIALIZED (
                     SELECT
-                        asin,
-                        domain,
-                        MAX(date) AS latest_history_date,
-                        COUNT(*) FILTER (WHERE date >= CURRENT_DATE - INTERVAL '30 days') AS history_rows_30d,
-                        MAX(CASE WHEN date >= CURRENT_DATE - INTERVAL '30 days' AND (monthly_sold IS NOT NULL OR bsr IS NOT NULL) THEN 1 ELSE 0 END) AS has_sales_signal_30d,
-                        MAX(CASE WHEN date >= CURRENT_DATE - INTERVAL '30 days' AND (
-                            amazon_price IS NOT NULL OR new_price IS NOT NULL OR buy_box_price IS NOT NULL OR list_price IS NOT NULL
+                        r.asin,
+                        r.domain,
+                        COALESCE(r.marketplace, '') AS marketplace,
+                        COALESCE(r.product_title, '') AS product_title,
+                        COALESCE(r.brand, '') AS brand,
+                        COALESCE(r.category, '') AS category,
+                        COALESCE(r.category_path, '') AS category_path,
+                        COALESCE(r.search_term, '') AS search_term,
+                        COALESCE(r.business_priority, r.priority, 0) AS business_priority,
+                        COALESCE(r.business_tier, '') AS business_tier,
+                        COALESCE(r.is_active, TRUE) AS is_active,
+                        s.price AS current_price,
+                        s.rating AS current_rating,
+                        s.review_count AS current_review_count,
+                        s.bsr AS current_bsr,
+                        COALESCE(s.total_offer_count, s.seller_count, s.retrieved_offer_count) AS current_offer_count,
+                        (
+                            q.text_match_score
+                            + q.keyword_match_score
+                            + q.required_product_term_match_score
+                            + (LEAST(GREATEST(COALESCE(r.business_priority, r.priority, 0), 0), 100) / 10.0)
+                        ) AS sql_prefilter_score
+                    FROM sync.keepa_asin_registry r
+                    LEFT JOIN sync.keepa_product_snapshot s
+                        ON r.asin = s.asin AND r.domain = s.domain
+                    CROSS JOIN LATERAL (
+                        SELECT
+                            COALESCE(
+                                SUM(
+                                    CASE WHEN LOWER(COALESCE(r.product_title, '')) LIKE ('%%' || term || '%%') ESCAPE '\\' THEN 80 ELSE 0 END
+                                    + CASE WHEN LOWER(COALESCE(r.category, '')) LIKE ('%%' || term || '%%') ESCAPE '\\' THEN 50 ELSE 0 END
+                                    + CASE WHEN LOWER(COALESCE(r.category_path, '')) LIKE ('%%' || term || '%%') ESCAPE '\\' THEN 45 ELSE 0 END
+                                    + CASE WHEN LOWER(COALESCE(r.search_term, '')) LIKE ('%%' || term || '%%') ESCAPE '\\' THEN 35 ELSE 0 END
+                                ),
+                                0
+                            )::DOUBLE PRECISION AS text_match_score,
+                            COALESCE(
+                                SUM(
+                                    CASE WHEN EXISTS (
+                                        SELECT 1
+                                        FROM sync.asin_keyword_mapping km
+                                        WHERE km.domain = r.domain
+                                          AND km.asin = r.asin
+                                          AND LOWER(km.keyword) LIKE ('%%' || term || '%%') ESCAPE '\\'
+                                    ) THEN 42 ELSE 0 END
+                                ),
+                                0
+                            )::DOUBLE PRECISION AS keyword_match_score
+                            ,
+                            COALESCE(
+                                (
+                                    SELECT SUM(
+                                        CASE WHEN LOWER(COALESCE(r.product_title, '')) LIKE ('%%' || required_term || '%%') ESCAPE '\\' THEN 90 ELSE 0 END
+                                        + CASE WHEN LOWER(COALESCE(r.category, '')) LIKE ('%%' || required_term || '%%') ESCAPE '\\' THEN 55 ELSE 0 END
+                                        + CASE WHEN LOWER(COALESCE(r.category_path, '')) LIKE ('%%' || required_term || '%%') ESCAPE '\\' THEN 60 ELSE 0 END
+                                        + CASE WHEN EXISTS (
+                                            SELECT 1
+                                            FROM sync.asin_keyword_mapping km
+                                            WHERE km.domain = r.domain
+                                              AND km.asin = r.asin
+                                              AND LOWER(km.keyword) LIKE ('%%' || required_term || '%%') ESCAPE '\\'
+                                        ) THEN 48 ELSE 0 END
+                                    )
+                                    FROM UNNEST((SELECT terms FROM required_product_terms)) AS required_term
+                                ),
+                                0
+                            )::DOUBLE PRECISION AS required_product_term_match_score
+                        FROM UNNEST((SELECT terms FROM query_terms)) AS term
+                    ) q
+                    WHERE r.domain = %s
+                      AND (%s IS FALSE OR COALESCE(r.is_active, TRUE) = TRUE)
+                      AND (%s::DOUBLE PRECISION IS NULL OR s.price IS NULL OR s.price >= %s::DOUBLE PRECISION)
+                      AND (%s::DOUBLE PRECISION IS NULL OR s.price IS NULL OR s.price <= %s::DOUBLE PRECISION)
+                      AND (
+                          CARDINALITY((SELECT terms FROM query_terms)) = 0
+                          OR q.text_match_score > 0
+                          OR q.keyword_match_score > 0
+                      )
+                      AND (
+                          CARDINALITY((SELECT terms FROM required_product_terms)) = 0
+                          OR q.required_product_term_match_score > 0
+                      )
+                ),
+                ranked_registry AS MATERIALIZED (
+                    SELECT
+                        *,
+                        COUNT(*) OVER() AS sql_prefilter_total_count
+                    FROM matched_registry
+                    ORDER BY
+                        sql_prefilter_score DESC,
+                        business_priority DESC,
+                        current_review_count DESC NULLS LAST
+                    LIMIT %s
+                ),
+                history_flags AS (
+                    SELECT
+                        h.asin,
+                        h.domain,
+                        MAX(h.date) AS latest_history_date,
+                        COUNT(*) FILTER (WHERE h.date >= CURRENT_DATE - INTERVAL '30 days') AS history_rows_30d,
+                        MAX(CASE WHEN h.date >= CURRENT_DATE - INTERVAL '30 days' AND (h.monthly_sold IS NOT NULL OR h.bsr IS NOT NULL) THEN 1 ELSE 0 END) AS has_sales_signal_30d,
+                        MAX(CASE WHEN h.date >= CURRENT_DATE - INTERVAL '30 days' AND (
+                            h.amazon_price IS NOT NULL OR h.new_price IS NOT NULL OR h.buy_box_price IS NOT NULL OR h.list_price IS NOT NULL
                         ) THEN 1 ELSE 0 END) AS has_price_data_30d
-                    FROM sync.keepa_product_history
-                    WHERE domain = %s
+                    FROM sync.keepa_product_history h
+                    JOIN ranked_registry r
+                        ON h.asin = r.asin AND h.domain = r.domain
+                    WHERE h.domain = %s
                     GROUP BY 1, 2
                 ),
                 keyword_agg AS (
-                    SELECT asin, domain, ARRAY_AGG(DISTINCT keyword ORDER BY keyword) AS keywords
-                    FROM sync.asin_keyword_mapping
-                    WHERE domain = %s
-                    GROUP BY 1, 2
+                    SELECT m.asin, m.domain, ARRAY_AGG(DISTINCT m.keyword ORDER BY m.keyword) AS keywords
+                    FROM sync.asin_keyword_mapping m
+                    JOIN ranked_registry r
+                        ON m.asin = r.asin AND m.domain = r.domain
+                    WHERE m.domain = %s
+                    GROUP BY m.asin, m.domain
                 )
                 SELECT
                     r.asin,
                     r.domain,
-                    COALESCE(r.marketplace, '') AS marketplace,
-                    COALESCE(r.product_title, '') AS product_title,
-                    COALESCE(r.brand, '') AS brand,
-                    COALESCE(r.category, '') AS category,
-                    COALESCE(r.category_path, '') AS category_path,
-                    COALESCE(r.search_term, '') AS search_term,
-                    COALESCE(r.business_priority, r.priority, 0) AS business_priority,
-                    COALESCE(r.business_tier, '') AS business_tier,
-                    COALESCE(r.is_active, TRUE) AS is_active,
-                    s.price AS current_price,
-                    s.rating AS current_rating,
-                    s.review_count AS current_review_count,
-                    s.bsr AS current_bsr,
-                    COALESCE(s.total_offer_count, s.seller_count, s.retrieved_offer_count) AS current_offer_count,
+                    r.marketplace,
+                    r.product_title,
+                    r.brand,
+                    r.category,
+                    r.category_path,
+                    r.search_term,
+                    r.business_priority,
+                    r.business_tier,
+                    r.is_active,
+                    r.current_price,
+                    r.current_rating,
+                    r.current_review_count,
+                    r.current_bsr,
+                    r.current_offer_count,
                     COALESCE(h.history_rows_30d, 0) AS history_rows_30d,
                     COALESCE(h.has_sales_signal_30d, 0) AS has_sales_signal_30d,
                     COALESCE(h.has_price_data_30d, 0) AS has_price_data_30d,
                     h.latest_history_date,
-                    COALESCE(k.keywords, ARRAY[]::VARCHAR[]) AS keywords
-                FROM sync.keepa_asin_registry r
-                LEFT JOIN sync.keepa_product_snapshot s
-                    ON r.asin = s.asin AND r.domain = s.domain
+                    COALESCE(k.keywords, ARRAY[]::VARCHAR[]) AS keywords,
+                    r.sql_prefilter_score,
+                    r.sql_prefilter_total_count
+                FROM ranked_registry r
                 LEFT JOIN history_flags h
                     ON r.asin = h.asin AND r.domain = h.domain
                 LEFT JOIN keyword_agg k
                     ON r.asin = k.asin AND r.domain = k.domain
-                WHERE r.domain = %s
                 """,
-                [domain, domain, domain],
+                [
+                    sql_prefilter_terms,
+                    sql_required_product_terms,
+                    domain,
+                    active_only,
+                    price_min,
+                    price_min,
+                    price_max,
+                    price_max,
+                    prefilter_limit,
+                    domain,
+                    domain,
+                ],
             )
 
     async def resolve_candidates(self, request: ResolveCandidatesRequest) -> dict[str, Any]:
+        request_started_at = time.perf_counter()
         domain, marketplace = _normalize_marketplace(request.marketplace)
 
-        # LLM normalization (network I/O) and PG fetch (DB I/O) run in parallel
-        normalization, rows = await asyncio.gather(
-            asyncio.to_thread(
-                QUERY_ASSISTANT.normalize,
-                product_query=request.product_query,
-                query_aliases=request.query_aliases,
-                category_hints=request.category_hints,
-                marketplace=marketplace,
-            ),
-            asyncio.to_thread(self._fetch_domain_candidates, domain),
+        normalization_started_at = time.perf_counter()
+        normalization = await asyncio.to_thread(
+            QUERY_ASSISTANT.normalize,
+            product_query=request.product_query,
+            query_aliases=request.query_aliases,
+            category_hints=request.category_hints,
+            marketplace=marketplace,
         )
+        normalization_ms = int((time.perf_counter() - normalization_started_at) * 1000)
 
         normalized_phrases, tokens, query_expansions = _build_query_variants(
             normalization.product_query,
             normalization.query_aliases,
             normalization.category_hints,
+        )
+        required_product_terms = _build_required_product_terms(normalized_phrases, tokens)
+        sql_prefilter_terms = _build_sql_prefilter_terms(normalized_phrases, tokens)
+        sql_required_product_terms = _build_sql_prefilter_terms(required_product_terms, [], max_terms=12)
+        sql_prefilter_limit = _candidate_sql_prefilter_limit(request.max_candidates)
+
+        def run_domain_fetch() -> tuple[list[dict[str, Any]], int]:
+            started_at = time.perf_counter()
+            result = self._fetch_domain_candidates(
+                domain,
+                sql_prefilter_terms=sql_prefilter_terms,
+                sql_required_product_terms=sql_required_product_terms,
+                active_only=request.active_only,
+                price_min=request.price_min,
+                price_max=request.price_max,
+                prefilter_limit=sql_prefilter_limit,
+            )
+            return result, int((time.perf_counter() - started_at) * 1000)
+
+        rows, pg_fetch_ms = await asyncio.to_thread(run_domain_fetch)
+
+        scoring_started_at = time.perf_counter()
+        sql_prefilter_total_count = max(
+            [int(row.get("sql_prefilter_total_count") or 0) for row in rows] or [0]
         )
 
         candidates: list[dict[str, Any]] = []
@@ -1219,6 +1549,11 @@ class ProductThemeService:
             score, reasons, breakdown = _score_candidate(record, normalized_phrases, tokens)
             if score <= 0:
                 continue
+            root_category_name = _category_level_name(record.category_path, 0)
+            category_l2_name = _category_level_name(record.category_path, 1)
+            category_l3_name = _category_level_name(record.category_path, 2)
+            leaf_category_name = _leaf_category_name(record.category_path, record.category)
+            fine_category_name = _fine_category_name(record.category_path, record.category)
             candidates.append(
                 {
                     "asin": record.asin,
@@ -1228,6 +1563,11 @@ class ProductThemeService:
                     "brand": record.brand,
                     "category": record.category,
                     "category_path": record.category_path,
+                    "root_category_name": root_category_name,
+                    "category_l2_name": category_l2_name,
+                    "category_l3_name": category_l3_name,
+                    "leaf_category_name": leaf_category_name,
+                    "fine_category_name": fine_category_name,
                     "search_term": record.search_term,
                     "keywords": record.keywords,
                     "business_priority": record.business_priority,
@@ -1241,11 +1581,34 @@ class ProductThemeService:
                     "has_sales_signal_30d": record.has_sales_signal_30d,
                     "has_price_data_30d": record.has_price_data_30d,
                     "latest_history_date": record.latest_history_date,
+                    "sql_prefilter_score": round(float(row.get("sql_prefilter_score") or 0), 2),
                     "match_score": round(score, 2),
                     "match_reasons": reasons,
                     "match_breakdown": breakdown,
                 }
             )
+
+        candidate_total_before_semantic_category_anchor = len(candidates)
+        fine_category_anchored_candidates = [
+            item
+            for item in candidates
+            if _candidate_field_matches_required_terms(
+                item,
+                ["leaf_category_name", "fine_category_name"],
+                required_product_terms,
+            )
+        ]
+        category_anchored_candidates = [
+            item
+            for item in candidates
+            if (item.get("match_breakdown") or {}).get("semantic_field_required_product_terms")
+        ]
+        semantic_fine_category_anchor_applied = bool(required_product_terms and fine_category_anchored_candidates)
+        semantic_category_anchor_applied = bool(required_product_terms and (fine_category_anchored_candidates or category_anchored_candidates))
+        if semantic_fine_category_anchor_applied:
+            candidates = fine_category_anchored_candidates
+        elif semantic_category_anchor_applied:
+            candidates = category_anchored_candidates
 
         candidates.sort(
             key=lambda item: (
@@ -1260,6 +1623,7 @@ class ProductThemeService:
         candidate_items = candidates[: request.max_candidates]
         theme_extraction = normalization.theme_extraction
         recall_normalization = normalization.recall_normalization
+        scoring_ms = int((time.perf_counter() - scoring_started_at) * 1000)
 
         return {
             "marketplace": marketplace,
@@ -1269,6 +1633,22 @@ class ProductThemeService:
             "query_phrases": normalized_phrases,
             "query_tokens": tokens,
             "query_expansions": query_expansions,
+            "required_product_terms": required_product_terms,
+            "ranking_policy": {
+                "primary_sort": ["match_score", "business_priority", "has_sales_signal_30d", "current_review_count"],
+                "sql_prefilter_sort": ["sql_prefilter_score", "business_priority", "current_review_count"],
+                "semantic_gate": "required_product_terms must match high-signal product fields before a candidate can enter the final pool",
+                "semantic_category_anchor": "when leaf/fine category anchors exist they are preferred; otherwise category/keyword anchored candidates exclude title-only matches",
+                "match_score_components": ["phrase_score", "token_score", "business_score", "freshness_score", "completeness_score"],
+                "matched_fields": ["product_title", "category", "category_path", "leaf_category_name", "fine_category_name", "keywords"],
+                "note": "candidate filtering uses SQL lexical prefilter/coarse sort plus required product-term gating before Python exact scoring; product-specific core-vs-adjacent cleanup should use returned candidate_items fields or a downstream configurable classifier, not hard-coded product names",
+            },
+            "timing_ms": {
+                "query_normalization": normalization_ms,
+                "domain_candidate_fetch": pg_fetch_ms,
+                "scoring_and_sorting": scoring_ms,
+                "total": int((time.perf_counter() - request_started_at) * 1000),
+            },
             "query_normalization": {
                 "mode": normalization.normalization_mode,
                 "llm_used": normalization.llm_used,
@@ -1316,15 +1696,26 @@ class ProductThemeService:
             },
             "candidate_count": len(candidate_items),
             "candidate_total_before_truncate": len(candidates),
+            "candidate_total_before_semantic_category_anchor": candidate_total_before_semantic_category_anchor,
+            "semantic_fine_category_anchor_applied": semantic_fine_category_anchor_applied,
+            "semantic_category_anchor_applied": semantic_category_anchor_applied,
+            "candidate_sql_prefilter_count": sql_prefilter_total_count,
+            "candidate_sql_prefilter_limit": sql_prefilter_limit,
+            "candidate_sql_prefilter_truncated": sql_prefilter_total_count > sql_prefilter_limit,
             "truncated": truncated,
             "matched_categories": _unique_nonempty([item["category"] for item in candidate_items])[:10],
+            "matched_leaf_categories": _category_distribution(candidate_items, "leaf_category_name"),
+            "matched_fine_categories": _category_distribution(candidate_items, "fine_category_name"),
+            "matched_root_categories": _category_distribution(candidate_items, "root_category_name"),
             "matched_keywords": _unique_nonempty([keyword for item in candidate_items for keyword in item["keywords"]])[:20],
             "candidate_asins": [item["asin"] for item in candidate_items],
             "candidate_items": candidate_items,
             "recall_notes": [
                 "when configured, recall preparation now runs as two internal stages: theme extraction first, then recall normalization",
                 "the external resolve_candidates tool surface stays merged; only the internal service layer is split into extraction and normalization",
-                "candidate pool is resolved by multi-field recall over title/category/category_path/search_term/keyword",
+                "candidate pool is resolved by multi-field recall over title/category/category_path/search_term/keyword with required product-term gating",
+                "SQL prefilter narrows the domain candidate set before Python exact scoring, so downstream tools should rely on returned candidate_asins rather than re-scanning visible titles",
+                "leaf_category_name and fine_category_name are preferred for product analysis; root/L2/L3 categories can be too coarse for candidate cleanup",
                 "built-in Chinese-to-English query expansion remains as a fallback bridge for common product terms when source data is English-dominant",
                 "business_priority and recent data completeness are used as ranking boosters, not hard filters",
             ],
@@ -2019,22 +2410,25 @@ class ProductThemeService:
             ),
             filtered AS (
                 SELECT
-                    asin,
-                    domain,
-                    product_title,
-                    brand,
-                    category,
-                    effective_price,
-                    rating,
-                    review_count,
-                    COALESCE(new_offer_count, 0) + COALESCE(used_offer_count, 0) AS offer_count,
-                    bsr,
-                    estimated_daily_sales,
-                    date
-                FROM serving.theme_base_daily
-                WHERE domain = %s
-                  AND asin = ANY(%s)
-                  AND date >= (
+                    d.asin,
+                    d.domain,
+                    d.product_title,
+                    d.brand,
+                    COALESCE(NULLIF(d.category, ''), NULLIF(r.category, '')) AS category,
+                    COALESCE(r.category_path, '') AS category_path,
+                    d.effective_price,
+                    d.rating,
+                    d.review_count,
+                    COALESCE(d.new_offer_count, 0) + COALESCE(d.used_offer_count, 0) AS offer_count,
+                    d.bsr,
+                    d.estimated_daily_sales,
+                    d.date
+                FROM serving.theme_base_daily d
+                LEFT JOIN sync.keepa_asin_registry r
+                    ON d.asin = r.asin AND d.domain = r.domain
+                WHERE d.domain = %s
+                  AND d.asin = ANY(%s)
+                  AND d.date >= (
                       SELECT max_date - (%s * INTERVAL '1 day')
                       FROM max_date
                   )
@@ -2044,6 +2438,7 @@ class ProductThemeService:
                 product_title,
                 brand,
                 category,
+                category_path,
                 effective_price,
                 rating,
                 review_count,
@@ -2136,6 +2531,7 @@ class ProductThemeService:
                     "product_title": latest_row.get("product_title"),
                     "brand": latest_row.get("brand"),
                     "category": latest_row.get("category"),
+                    "category_path": latest_row.get("category_path"),
                     "effective_price": latest_row.get("effective_price"),
                     "rating": latest_row.get("rating"),
                     "review_count": latest_row.get("review_count"),
@@ -2195,6 +2591,9 @@ class ProductThemeService:
             "product_title": row.get("product_title"),
             "brand": row.get("brand"),
             "category": row.get("category"),
+            "category_path": row.get("category_path"),
+            "l3_category_name": self._extract_l3_category_name(row.get("category_path"), row.get("category")),
+            "leaf_category_name": self._extract_leaf_category_name(row.get("category_path"), row.get("category")),
             "effective_price": row.get("effective_price"),
             "rating": row.get("rating"),
             "review_count": row.get("review_count"),
@@ -2204,6 +2603,19 @@ class ProductThemeService:
             "latest_date": self._format_asin_history_date(row.get("date")),
             "source": "local_theme_base_daily",
         }
+
+    def _extract_l3_category_name(self, category_path: Any, fallback_category: Any = None) -> str | None:
+        value = _category_level_name(category_path, 2)
+        if value:
+            return value
+        leaf = _leaf_category_name(category_path)
+        if leaf:
+            return leaf
+        fallback = str(fallback_category or "").strip()
+        return fallback or None
+
+    def _extract_leaf_category_name(self, category_path: Any, fallback_category: Any = None) -> str | None:
+        return _leaf_category_name(category_path, fallback_category)
 
     def _build_asin_history_window_summary(self, rows: list[dict[str, Any]], interval: str, window_days: int) -> dict[str, Any] | None:
         if not rows:

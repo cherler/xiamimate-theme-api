@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 import json
+import os
 import re
 
 from data_platform.llm_client import LLMJSONParseError, LLMProvider, build_llm_provider
@@ -118,6 +119,59 @@ def _extract_phrases_from_text_output(raw_text: str) -> list[str]:
 
     normalized_phrases = _sanitize_phrase_list(phrases, max_items=8)
     return [phrase for phrase in normalized_phrases if len(phrase) >= 3]
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _looks_like_simple_english_catalog_query(
+    product_query: str,
+    query_aliases: list[str] | None = None,
+    category_hints: list[str] | None = None,
+) -> bool:
+    if query_aliases or category_hints:
+        return False
+    text = _trim_phrase(product_query, max_length=240)
+    if not text or len(text) > 80:
+        return False
+    if re.search(r"[^\x00-\x7F]", text):
+        return False
+    if re.search(r"[?？。；;!！\n\r]", text):
+        return False
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    if not 1 <= len(tokens) <= 6:
+        return False
+    intent_words = {
+        "analyze",
+        "analysis",
+        "compare",
+        "competitor",
+        "competitors",
+        "find",
+        "report",
+        "research",
+        "select",
+        "trend",
+        "trends",
+    }
+    return not any(token in intent_words for token in tokens)
+
+
+def _should_skip_llm_for_simple_query(
+    env_prefix: str,
+    product_query: str,
+    query_aliases: list[str] | None = None,
+    category_hints: list[str] | None = None,
+) -> bool:
+    if _env_flag(f"{env_prefix}_FORCE_LLM", default=False):
+        return False
+    if not _env_flag(f"{env_prefix}_SKIP_SIMPLE_ENGLISH", default=True):
+        return False
+    return _looks_like_simple_english_catalog_query(product_query, query_aliases, category_hints)
 
 
 def _parse_confidence(value: object) -> float | None:
@@ -642,6 +696,36 @@ class ProductRecallQueryAssistant:
         category_hints: list[str] | None = None,
         marketplace: str = "US",
     ) -> ProductQueryAssistantResult:
+        if _should_skip_llm_for_simple_query(self.env_prefix, product_query, query_aliases, category_hints):
+            provider = self.provider()
+            extraction = _build_theme_extraction_result(
+                product_query,
+                list(query_aliases or []),
+                list(category_hints or []),
+                mode="rules_simple_english",
+                llm_used=False,
+                llm_provider=provider.provider_name,
+                llm_model=provider.model or None,
+            )
+            normalization = _build_recall_normalization_result(
+                product_query,
+                extraction.extracted_theme,
+                extraction.query_aliases,
+                extraction.category_hints,
+                mode="rules_simple_english",
+                llm_used=False,
+                llm_provider=provider.provider_name,
+                llm_model=provider.model or None,
+                normalized_product_query=extraction.extracted_theme,
+            )
+            return _compose_query_assistant_result(
+                raw_product_query=product_query,
+                raw_query_aliases=list(query_aliases or []),
+                raw_category_hints=list(category_hints or []),
+                extraction=extraction,
+                normalization=normalization,
+            )
+
         extraction = self.extract_theme_intent(
             product_query=product_query,
             query_aliases=query_aliases,
