@@ -12,13 +12,14 @@ from statistics import median
 import threading
 import time
 from typing import Any
+import uuid
 
 import requests as http_requests
 
 import jieba
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, root_validator, validator
 
 try:
     import psycopg2
@@ -83,6 +84,9 @@ DOMAIN_TO_MARKETPLACE = {value: key for key, value in MARKETPLACE_TO_DOMAIN.item
 ASIN_PATTERN = re.compile(r"^[A-Z0-9]{8,16}$")
 ASCII_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 MIN_TOKEN_LENGTH = 2
+DEFAULT_MIN_CANDIDATE_POOL_SIZE = 8
+DEFAULT_TARGET_CANDIDATE_POOL_SIZE = 20
+DEFAULT_DOMINANT_CATEGORY_SHARE_THRESHOLD = 0.7
 
 QUERY_MODIFIER_TOKENS = {
     "adjustable",
@@ -142,6 +146,13 @@ class ResolveCandidatesRequest(BaseModel):
     marketplace: str | int = "US"
     query_aliases: list[str] = Field(default_factory=list)
     category_hints: list[str] = Field(default_factory=list)
+    recall_mode: str = "keyword"
+    category_id: int | None = None
+    category_path: str | None = None
+    include_descendants: bool = True
+    min_pool_size: int = Field(default=DEFAULT_MIN_CANDIDATE_POOL_SIZE, ge=1, le=500)
+    target_pool_size: int = Field(default=DEFAULT_TARGET_CANDIDATE_POOL_SIZE, ge=1, le=500)
+    expand_if_small: bool = False
     price_min: float | None = None
     price_max: float | None = None
     max_candidates: int = Field(default=50, ge=1, le=500)
@@ -155,11 +166,149 @@ class ResolveCandidatesRequest(BaseModel):
             return []
         return v
 
+    @validator("recall_mode")
+    def _validate_recall_mode(cls, v: str) -> str:  # noqa: N805
+        value = (v or "keyword").strip().lower()
+        allowed = {"keyword", "category", "hybrid", "asin_seed_expand"}
+        if value not in allowed:
+            raise ValueError("recall_mode must be one of: keyword, category, hybrid, asin_seed_expand")
+        return value
+
+    @validator("category_path", pre=True, always=True)
+    def _normalize_optional_category_path(cls, v: Any) -> str | None:  # noqa: N805
+        if v is None:
+            return None
+        value = str(v).strip()
+        return value or None
+
+
+class CategoryResolveRequest(BaseModel):
+    marketplace: str | int = "US"
+    category_query: str | None = None
+    category_path: str | None = None
+    max_matches: int = Field(default=10, ge=1, le=50)
+
 
 class CandidatePoolRequest(BaseModel):
-    candidate_asins: list[str] = Field(..., min_length=1)
+    candidate_asins: list[str] = Field(default_factory=list)
+    candidate_pool_id: str | None = None
     marketplace: str | int = "US"
     window_days: int = Field(default=30, ge=7, le=180)
+
+    @validator("candidate_asins", pre=True, always=True)
+    def _accept_csv_asins(cls, v: Any) -> list[str]:  # noqa: N805
+        if isinstance(v, str):
+            return [s.strip() for s in v.split(",") if s.strip()]
+        if v is None:
+            return []
+        return v
+
+    @validator("candidate_pool_id", pre=True, always=True)
+    def _normalize_optional_pool_id(cls, v: Any) -> str | None:  # noqa: N805
+        if v is None:
+            return None
+        value = str(v).strip()
+        return value or None
+
+    @root_validator(skip_on_failure=True)
+    def _require_pool_reference(cls, values: dict[str, Any]) -> dict[str, Any]:  # noqa: N805
+        candidate_asins = values.get("candidate_asins") or []
+        candidate_pool_id = values.get("candidate_pool_id")
+        if not candidate_asins and not candidate_pool_id:
+            raise ValueError("candidate_asins or candidate_pool_id is required")
+        return values
+
+
+class CategoryBenchmarkRequest(CandidatePoolRequest):
+    benchmark_category_id: int | None = None
+    benchmark_category_path: str | None = None
+    benchmark_level: str = "auto"
+    include_descendants: bool = True
+
+    @validator("benchmark_level")
+    def _validate_benchmark_level(cls, v: str) -> str:  # noqa: N805
+        value = (v or "auto").strip().lower()
+        allowed = {"auto", "leaf", "fine", "l3", "l2", "l1", "root"}
+        if value not in allowed:
+            raise ValueError("benchmark_level must be one of: auto, leaf, fine, l3, l2, l1, root")
+        return value
+
+    @validator("benchmark_category_path", pre=True, always=True)
+    def _normalize_optional_benchmark_category_path(cls, v: Any) -> str | None:  # noqa: N805
+        if v is None:
+            return None
+        value = str(v).strip()
+        return value or None
+
+
+class CandidateExpansionJobRequest(BaseModel):
+    product_query: str | None = None
+    marketplace: str | int = "US"
+    recall_mode: str = "hybrid"
+    category_id: int | None = None
+    category_path: str | None = None
+    include_descendants: bool = True
+    target_asin_count: int = Field(default=20, ge=1, le=500)
+    min_pool_size: int = Field(default=DEFAULT_MIN_CANDIDATE_POOL_SIZE, ge=1, le=500)
+    source: str = "agent_interactive"
+    priority: str = "interactive_normal"
+    requested_by_session_id: str | None = None
+    requested_by_user_id: str | None = None
+    idempotency_key: str | None = None
+    notes: str | None = None
+
+    @validator("recall_mode")
+    def _validate_expansion_recall_mode(cls, v: str) -> str:  # noqa: N805
+        value = (v or "hybrid").strip().lower()
+        allowed = {"keyword", "category", "hybrid", "asin_seed_expand"}
+        if value not in allowed:
+            raise ValueError("recall_mode must be one of: keyword, category, hybrid, asin_seed_expand")
+        return value
+
+    @validator("source")
+    def _validate_expansion_source(cls, v: str) -> str:  # noqa: N805
+        value = (v or "agent_interactive").strip().lower()
+        allowed = {"agent_interactive", "auto_collect", "manual", "scheduled"}
+        if value not in allowed:
+            raise ValueError("source must be one of: agent_interactive, auto_collect, manual, scheduled")
+        return value
+
+    @validator("priority")
+    def _validate_expansion_priority(cls, v: str) -> str:  # noqa: N805
+        value = (v or "interactive_normal").strip().lower()
+        allowed = {"interactive_high", "interactive_normal", "background_high", "background_low"}
+        if value not in allowed:
+            raise ValueError("priority must be one of: interactive_high, interactive_normal, background_high, background_low")
+        return value
+
+    @validator("product_query", "category_path", "requested_by_session_id", "requested_by_user_id", "idempotency_key", "notes", pre=True, always=True)
+    def _normalize_optional_string(cls, v: Any) -> str | None:  # noqa: N805
+        if v is None:
+            return None
+        value = str(v).strip()
+        return value or None
+
+
+class CandidateExpansionJobStatusRequest(BaseModel):
+    job_id: str | None = None
+    marketplace: str | int = "US"
+    statuses: list[str] = Field(default_factory=lambda: ["queued", "waiting_token", "discovering", "hydrating", "syncing"])
+    limit: int = Field(default=20, ge=1, le=100)
+
+    @validator("statuses", pre=True, always=True)
+    def _accept_csv_statuses(cls, v: Any) -> list[str]:  # noqa: N805
+        if isinstance(v, str):
+            return [s.strip().lower() for s in v.split(",") if s.strip()]
+        if v is None:
+            return []
+        return [str(s).strip().lower() for s in v if str(s).strip()]
+
+    @validator("job_id", pre=True, always=True)
+    def _normalize_optional_job_id(cls, v: Any) -> str | None:  # noqa: N805
+        if v is None:
+            return None
+        value = str(v).strip()
+        return value or None
 
 
 class WeakForecastRequest(CandidatePoolRequest):
@@ -396,6 +545,135 @@ def _category_distribution(items: list[dict[str, Any]], field_name: str, limit: 
         {"category": category, "candidate_count": count}
         for category, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:limit]
     ]
+
+
+def _dominant_category_summary(
+    distribution: list[dict[str, Any]],
+    candidate_count: int,
+) -> tuple[str | None, int, float]:
+    if not distribution or candidate_count <= 0:
+        return None, 0, 0.0
+    top = distribution[0]
+    category = str(top.get("category") or "").strip() or None
+    count = int(top.get("candidate_count") or 0)
+    share = round(count / candidate_count, 4) if candidate_count > 0 else 0.0
+    return category, count, share
+
+
+def _build_candidate_pool_quality(
+    candidate_items: list[dict[str, Any]],
+    *,
+    candidate_total_before_semantic_gate: int,
+    candidate_total_before_category_anchor: int,
+    leaf_distribution: list[dict[str, Any]],
+    fine_distribution: list[dict[str, Any]],
+    root_distribution: list[dict[str, Any]],
+    min_pool_size: int = DEFAULT_MIN_CANDIDATE_POOL_SIZE,
+    target_pool_size: int = DEFAULT_TARGET_CANDIDATE_POOL_SIZE,
+    dominant_category_share_threshold: float = DEFAULT_DOMINANT_CATEGORY_SHARE_THRESHOLD,
+) -> dict[str, Any]:
+    candidate_count = len(candidate_items)
+    dominant_leaf_category, dominant_leaf_count, dominant_leaf_share = _dominant_category_summary(
+        leaf_distribution,
+        candidate_count,
+    )
+    dominant_fine_category, dominant_fine_count, dominant_fine_share = _dominant_category_summary(
+        fine_distribution,
+        candidate_count,
+    )
+    dominant_root_category, dominant_root_count, dominant_root_share = _dominant_category_summary(
+        root_distribution,
+        candidate_count,
+    )
+    has_category_anchor = bool(
+        dominant_leaf_category
+        and dominant_leaf_category != "其他/未归类"
+        and dominant_leaf_share >= dominant_category_share_threshold
+    ) or bool(
+        dominant_fine_category
+        and dominant_fine_category != "其他/未归类"
+        and dominant_fine_share >= dominant_category_share_threshold
+    )
+
+    insufficient_reasons: list[str] = []
+    if candidate_count == 0:
+        insufficient_reasons.append("no_candidates_after_recall")
+    elif candidate_count < min_pool_size:
+        insufficient_reasons.append("pure_candidate_count_below_min_pool_size")
+    if candidate_count > 0 and not has_category_anchor:
+        insufficient_reasons.append("dominant_category_share_below_threshold")
+
+    is_sufficient_for_analysis = candidate_count >= min_pool_size and has_category_anchor
+    should_expand_pool = (not is_sufficient_for_analysis) or candidate_count < target_pool_size
+    if candidate_count < target_pool_size and "candidate_count_below_target_pool_size" not in insufficient_reasons:
+        insufficient_reasons.append("candidate_count_below_target_pool_size")
+
+    if is_sufficient_for_analysis and candidate_count >= target_pool_size:
+        confidence = "high"
+    elif is_sufficient_for_analysis:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    return {
+        "candidate_count": candidate_count,
+        "candidate_total_before_semantic_gate": candidate_total_before_semantic_gate,
+        "candidate_total_before_category_anchor": candidate_total_before_category_anchor,
+        "min_pool_size": min_pool_size,
+        "target_pool_size": target_pool_size,
+        "dominant_category_share_threshold": dominant_category_share_threshold,
+        "dominant_leaf_category": dominant_leaf_category,
+        "dominant_leaf_count": dominant_leaf_count,
+        "dominant_leaf_share": dominant_leaf_share,
+        "dominant_fine_category": dominant_fine_category,
+        "dominant_fine_count": dominant_fine_count,
+        "dominant_fine_share": dominant_fine_share,
+        "dominant_root_category": dominant_root_category,
+        "dominant_root_count": dominant_root_count,
+        "dominant_root_share": dominant_root_share,
+        "category_anchor_confidence": confidence,
+        "is_sufficient_for_analysis": is_sufficient_for_analysis,
+        "should_expand_pool": should_expand_pool,
+        "insufficient_coverage_reason": None if is_sufficient_for_analysis else (insufficient_reasons[0] if insufficient_reasons else None),
+        "insufficient_coverage_reasons": insufficient_reasons,
+    }
+
+
+def _normalize_category_path_for_match(value: Any) -> str:
+    parts = _category_path_parts(value)
+    if parts:
+        return " > ".join(_normalize_text(part) for part in parts if _normalize_text(part))
+    return _normalize_text(str(value or ""))
+
+
+def _score_category_match(
+    *,
+    category_query: str | None,
+    category_path: str | None,
+    candidate_name: str | None,
+    candidate_path: str | None,
+) -> float:
+    query_norm = _normalize_text(str(category_query or ""))
+    requested_path_norm = _normalize_category_path_for_match(category_path)
+    candidate_name_norm = _normalize_text(str(candidate_name or ""))
+    candidate_path_norm = _normalize_category_path_for_match(candidate_path)
+
+    score = 0.0
+    if requested_path_norm:
+        if candidate_path_norm == requested_path_norm:
+            score = max(score, 0.98)
+        elif candidate_path_norm.endswith(requested_path_norm) or requested_path_norm.endswith(candidate_path_norm):
+            score = max(score, 0.88)
+        elif requested_path_norm in candidate_path_norm:
+            score = max(score, 0.8)
+    if query_norm:
+        if candidate_name_norm == query_norm:
+            score = max(score, 0.92)
+        elif query_norm in candidate_name_norm:
+            score = max(score, 0.84)
+        elif query_norm in candidate_path_norm:
+            score = max(score, 0.74)
+    return round(score, 4)
 
 
 def _candidate_field_matches_required_terms(item: dict[str, Any], field_names: list[str], required_terms: list[str]) -> bool:
@@ -872,6 +1150,198 @@ def _keepa_stats_price(stats: dict, key: str, index: int, is_yen: bool) -> float
 
 
 class ProductThemeService:
+    def _build_candidate_pool_lineage(
+        self,
+        *,
+        request: ResolveCandidatesRequest,
+        marketplace: str,
+        domain: int,
+        normalized_query: str,
+        normalized_phrases: list[str],
+        tokens: list[str],
+        query_expansions: list[str],
+    ) -> dict[str, Any]:
+        return {
+            "source": "resolve_candidates",
+            "ranking_version": "semantic_recall_v2",
+            "query": {
+                "raw_product_query": request.product_query,
+                "normalized_query": normalized_query,
+                "query_phrases": normalized_phrases,
+                "query_tokens": tokens,
+                "query_expansions": query_expansions,
+            },
+            "category": {
+                "category_id": request.category_id,
+                "category_path": request.category_path,
+                "include_descendants": request.include_descendants,
+            },
+            "filters": {
+                "marketplace": marketplace,
+                "domain": domain,
+                "recall_mode": request.recall_mode,
+                "price_min": request.price_min,
+                "price_max": request.price_max,
+                "active_only": request.active_only,
+                "min_pool_size": request.min_pool_size,
+                "target_pool_size": request.target_pool_size,
+                "max_candidates": request.max_candidates,
+            },
+            "sources": ["query", "category" if request.category_id is not None or request.category_path else "keyword"],
+        }
+
+    def _persist_candidate_pool(
+        self,
+        *,
+        candidate_pool_id: str,
+        domain: int,
+        marketplace: str,
+        request: ResolveCandidatesRequest,
+        normalized_query: str,
+        candidate_items: list[dict[str, Any]],
+        candidate_total_before_truncate: int,
+        pool_quality: dict[str, Any],
+        lineage: dict[str, Any],
+    ) -> dict[str, Any]:
+        if psycopg2 is None:
+            return {"persisted": False, "error": "psycopg2_unavailable"}
+
+        try:
+            pool_uuid = str(uuid.UUID(str(candidate_pool_id)))
+        except ValueError:
+            return {"persisted": False, "error": "invalid_candidate_pool_id"}
+
+        try:
+            with _postgres_conn() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO serving.candidate_pools (
+                            pool_id, version, domain, marketplace, product_query, normalized_query,
+                            recall_mode, category_id, category_path, include_descendants, filters,
+                            ranking_version, pool_quality, candidate_count,
+                            candidate_total_before_truncate, source, lineage, updated_at
+                        ) VALUES (
+                            %s::uuid, 1, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s::jsonb,
+                            %s, %s::jsonb, %s,
+                            %s, %s, %s::jsonb, NOW()
+                        )
+                        ON CONFLICT (pool_id) DO UPDATE SET
+                            updated_at = NOW(),
+                            candidate_count = EXCLUDED.candidate_count,
+                            candidate_total_before_truncate = EXCLUDED.candidate_total_before_truncate,
+                            pool_quality = EXCLUDED.pool_quality,
+                            lineage = EXCLUDED.lineage
+                        """,
+                        [
+                            pool_uuid,
+                            domain,
+                            marketplace,
+                            request.product_query,
+                            normalized_query,
+                            request.recall_mode,
+                            request.category_id,
+                            request.category_path,
+                            request.include_descendants,
+                            psycopg2.extras.Json(lineage.get("filters") or {}),
+                            lineage.get("ranking_version") or "semantic_recall_v2",
+                            psycopg2.extras.Json(pool_quality),
+                            len(candidate_items),
+                            candidate_total_before_truncate,
+                            "resolve_candidates",
+                            psycopg2.extras.Json(lineage),
+                        ],
+                    )
+                    cursor.execute("DELETE FROM serving.candidate_pool_items WHERE pool_id = %s::uuid", [pool_uuid])
+                    item_rows = []
+                    for rank, item in enumerate(candidate_items, start=1):
+                        asin = str(item.get("asin") or "").strip().upper()
+                        if not asin:
+                            continue
+                        item_rows.append(
+                            (
+                                pool_uuid,
+                                asin,
+                                domain,
+                                marketplace,
+                                rank,
+                                item.get("match_score"),
+                                psycopg2.extras.Json(item.get("match_reasons") or []),
+                                psycopg2.extras.Json(item),
+                            )
+                        )
+                    if item_rows:
+                        psycopg2.extras.execute_values(
+                            cursor,
+                            """
+                            INSERT INTO serving.candidate_pool_items (
+                                pool_id, asin, domain, marketplace, candidate_rank,
+                                match_score, match_reasons, item_snapshot
+                            ) VALUES %s
+                            """,
+                            item_rows,
+                            template="(%s::uuid, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)",
+                        )
+            return {"persisted": True, "item_count": len(candidate_items)}
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("candidate pool persistence failed: %s", exc)
+            return {"persisted": False, "error": str(exc)[:240]}
+
+    def _resolve_candidate_asins_for_pool_request(
+        self,
+        request: CandidatePoolRequest,
+        *,
+        domain: int,
+        marketplace: str,
+    ) -> tuple[list[str], dict[str, Any]]:
+        candidate_asins = _sanitize_asins(request.candidate_asins)
+        candidate_pool_ref = {
+            "candidate_pool_id": request.candidate_pool_id,
+            "resolved_from_pool": False,
+            "source": "candidate_asins" if candidate_asins else "candidate_pool_id",
+        }
+        if candidate_asins:
+            candidate_pool_ref["candidate_count"] = len(candidate_asins)
+            return candidate_asins, candidate_pool_ref
+
+        if not request.candidate_pool_id:
+            raise HTTPException(status_code=400, detail="candidate_asins or candidate_pool_id is required")
+        try:
+            pool_uuid = str(uuid.UUID(str(request.candidate_pool_id)))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid candidate_pool_id")
+
+        with _postgres_conn() as conn:
+            rows = _run_pg_dict_query(
+                conn,
+                """
+                SELECT p.pool_id::text AS pool_id, p.version, p.candidate_count,
+                       i.asin, i.candidate_rank
+                FROM serving.candidate_pools p
+                JOIN serving.candidate_pool_items i ON i.pool_id = p.pool_id
+                WHERE p.pool_id = %s::uuid
+                  AND p.domain = %s
+                ORDER BY i.candidate_rank ASC, i.asin ASC
+                """,
+                [pool_uuid, domain],
+            )
+        if not rows:
+            raise HTTPException(status_code=404, detail="candidate_pool_id not found for marketplace")
+
+        resolved_asins = _sanitize_asins([str(row["asin"]) for row in rows])
+        candidate_pool_ref.update(
+            {
+                "candidate_pool_id": pool_uuid,
+                "candidate_pool_version": int(rows[0].get("version") or 1),
+                "resolved_from_pool": True,
+                "candidate_count": len(resolved_asins),
+                "marketplace": marketplace,
+                "domain": domain,
+            }
+        )
+        return resolved_asins, candidate_pool_ref
+
     def _build_forecast_meta(self, coverage_row: dict[str, Any] | None = None) -> dict[str, Any]:
         coverage_row = coverage_row or {}
         return {
@@ -879,6 +1349,318 @@ class ProductThemeService:
             "snapshot_date": _iso_date_or_none(coverage_row.get("snapshot_date")),
             "forecast_week_start": _iso_date_or_none(coverage_row.get("forecast_week_start")),
             "forecast_year_week": coverage_row.get("forecast_year_week"),
+        }
+
+    def resolve_category(self, request: CategoryResolveRequest) -> dict[str, Any]:
+        domain, marketplace = _normalize_marketplace(request.marketplace)
+        category_query = str(request.category_query or "").strip()
+        category_path = str(request.category_path or "").strip()
+        if not category_query and not category_path:
+            raise HTTPException(status_code=400, detail="category_query or category_path is required")
+
+        search_text = _normalize_text(category_path or category_query)
+        search_like = f"%{search_text}%" if search_text else "%"
+
+        with _postgres_conn() as conn:
+            rows = _run_pg_dict_query(
+                conn,
+                """
+                WITH RECURSIVE category_tree AS (
+                    SELECT
+                        c.category_id,
+                        c.domain,
+                        c.category_en,
+                        c.category_cn,
+                        c.parent_id,
+                        c.depth,
+                        c.product_count,
+                        COALESCE(c.category_en, '')::text AS category_path
+                    FROM sync.keepa_category_registry c
+                    WHERE c.domain = %s
+                      AND (c.parent_id IS NULL OR c.depth = 1)
+
+                    UNION ALL
+
+                    SELECT
+                        child.category_id,
+                        child.domain,
+                        child.category_en,
+                        child.category_cn,
+                        child.parent_id,
+                        child.depth,
+                        child.product_count,
+                        CONCAT_WS(' > ', NULLIF(parent.category_path, ''), child.category_en)::text AS category_path
+                    FROM sync.keepa_category_registry child
+                    JOIN category_tree parent
+                      ON child.domain = parent.domain
+                     AND child.parent_id = parent.category_id
+                    WHERE child.category_id <> parent.category_id
+                ),
+                history_coverage AS (
+                    SELECT DISTINCT asin, domain
+                    FROM sync.keepa_product_history
+                    WHERE domain = %s
+                ),
+                coverage AS (
+                    SELECT
+                        r.category_id,
+                        COUNT(DISTINCT r.asin) FILTER (WHERE r.is_active) AS local_active_asin_count,
+                        COUNT(DISTINCT h.asin) FILTER (WHERE r.is_active) AS local_history_coverage_count
+                    FROM sync.keepa_asin_registry r
+                    LEFT JOIN history_coverage h
+                      ON r.asin = h.asin AND r.domain = h.domain
+                    WHERE r.domain = %s
+                    GROUP BY r.category_id
+                )
+                SELECT
+                    t.category_id,
+                    t.category_en,
+                    t.category_cn,
+                    t.parent_id,
+                    t.depth,
+                    t.product_count,
+                    t.category_path,
+                    COALESCE(c.local_active_asin_count, 0) AS local_active_asin_count,
+                    COALESCE(c.local_history_coverage_count, 0) AS local_history_coverage_count
+                FROM category_tree t
+                LEFT JOIN coverage c ON t.category_id = c.category_id
+                WHERE %s = ''
+                   OR LOWER(COALESCE(t.category_path, '')) LIKE %s
+                   OR LOWER(COALESCE(t.category_en, '')) LIKE %s
+                   OR LOWER(COALESCE(t.category_cn, '')) LIKE %s
+                LIMIT 300
+                """,
+                [domain, domain, domain, search_text, search_like, search_like, search_like],
+            )
+
+        matches: list[dict[str, Any]] = []
+        for row in rows:
+            match_confidence = _score_category_match(
+                category_query=category_query,
+                category_path=category_path,
+                candidate_name=str(row.get("category_en") or ""),
+                candidate_path=str(row.get("category_path") or ""),
+            )
+            if match_confidence <= 0:
+                continue
+            matches.append(
+                {
+                    "category_id": int(row["category_id"]) if row.get("category_id") is not None else None,
+                    "category_name": row.get("category_en"),
+                    "category_name_cn": row.get("category_cn"),
+                    "category_path": row.get("category_path"),
+                    "depth": int(row["depth"]) if row.get("depth") is not None else None,
+                    "product_count": int(row["product_count"] or 0),
+                    "parent_id": int(row["parent_id"]) if row.get("parent_id") is not None else None,
+                    "local_active_asin_count": int(row["local_active_asin_count"] or 0),
+                    "local_history_coverage_count": int(row["local_history_coverage_count"] or 0),
+                    "match_confidence": match_confidence,
+                }
+            )
+
+        matches.sort(
+            key=lambda item: (
+                item["match_confidence"],
+                item["local_active_asin_count"],
+                item["product_count"],
+            ),
+            reverse=True,
+        )
+        matches = matches[: request.max_matches]
+
+        return {
+            "marketplace": marketplace,
+            "domain": domain,
+            "category_query": category_query or None,
+            "category_path": category_path or None,
+            "match_count": len(matches),
+            "matches": matches,
+            "notes": [
+                "category_resolve reads local sync.keepa_category_registry and sync.keepa_asin_registry only; it does not consume Keepa tokens",
+                "local_active_asin_count and local_history_coverage_count indicate current local coverage before any online expansion",
+                "use category_id as the stable execution key; category_path is a readable input and fallback",
+            ],
+        }
+
+    def _estimate_candidate_expansion_tokens(self, request: CandidateExpansionJobRequest) -> int:
+        discovery_tokens = 50 if request.category_id is not None or request.category_path else 12
+        hydrate_tokens = min(request.target_asin_count, 100) * 2
+        return discovery_tokens + hydrate_tokens
+
+    def _format_candidate_expansion_job(self, row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "job_id": row.get("job_id"),
+            "marketplace": row.get("marketplace") or DOMAIN_TO_MARKETPLACE.get(int(row.get("domain") or 1), "US"),
+            "domain": int(row.get("domain") or 1),
+            "source": row.get("source"),
+            "priority": row.get("priority"),
+            "product_query": row.get("product_query"),
+            "recall_mode": row.get("recall_mode"),
+            "category_id": int(row["category_id"]) if row.get("category_id") is not None else None,
+            "category_path": row.get("category_path"),
+            "include_descendants": bool(row.get("include_descendants")),
+            "target_asin_count": int(row.get("target_asin_count") or 0),
+            "min_pool_size": int(row.get("min_pool_size") or 0),
+            "status": row.get("status"),
+            "status_reason": row.get("status_reason"),
+            "requested_by_session_id": row.get("requested_by_session_id"),
+            "requested_by_user_id": row.get("requested_by_user_id"),
+            "tokens_estimated": int(row.get("tokens_estimated") or 0),
+            "tokens_reserved": int(row.get("tokens_reserved") or 0),
+            "tokens_consumed": int(row.get("tokens_consumed") or 0),
+            "token_wait_until": _iso_date_or_none(row.get("token_wait_until")),
+            "result_candidate_asins": list(row.get("result_candidate_asins") or []),
+            "result_new_asin_count": int(row.get("result_new_asin_count") or 0),
+            "error_message": row.get("error_message"),
+            "created_at": _iso_date_or_none(row.get("created_at")),
+            "updated_at": _iso_date_or_none(row.get("updated_at")),
+            "started_at": _iso_date_or_none(row.get("started_at")),
+            "finished_at": _iso_date_or_none(row.get("finished_at")),
+            "meta_json": row.get("meta_json") or {},
+        }
+
+    def create_candidate_expansion_job(self, request: CandidateExpansionJobRequest) -> dict[str, Any]:
+        domain, marketplace = _normalize_marketplace(request.marketplace)
+        if not request.product_query and request.category_id is None and not request.category_path:
+            raise HTTPException(status_code=400, detail="product_query or category_id/category_path is required")
+
+        tokens_estimated = self._estimate_candidate_expansion_tokens(request)
+        status_reason = "queued for collector; no Keepa token is consumed by theme-api"
+        meta_json = {
+            "notes": request.notes,
+            "created_by": "theme-api",
+            "token_budget_policy": "collector-owned",
+        }
+
+        with _postgres_conn() as conn:
+            if request.idempotency_key:
+                existing = _run_pg_dict_query(
+                    conn,
+                    """
+                    SELECT *
+                    FROM sync.keepa_candidate_expansion_jobs
+                    WHERE idempotency_key = %s
+                    LIMIT 1
+                    """,
+                    [request.idempotency_key],
+                )
+                if existing:
+                    return {
+                        "job": self._format_candidate_expansion_job(existing[0]),
+                        "created": False,
+                        "notes": ["existing job returned by idempotency_key"],
+                    }
+
+            job_id = f"kexp_{uuid.uuid4().hex}"
+            rows = _run_pg_dict_query(
+                conn,
+                """
+                INSERT INTO sync.keepa_candidate_expansion_jobs (
+                    job_id,
+                    domain,
+                    marketplace,
+                    source,
+                    priority,
+                    product_query,
+                    recall_mode,
+                    category_id,
+                    category_path,
+                    include_descendants,
+                    target_asin_count,
+                    min_pool_size,
+                    status,
+                    status_reason,
+                    requested_by_session_id,
+                    requested_by_user_id,
+                    idempotency_key,
+                    tokens_estimated,
+                    meta_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    'queued', %s, %s, %s, %s, %s, %s::JSONB, NOW(), NOW()
+                )
+                RETURNING *
+                """,
+                [
+                    job_id,
+                    domain,
+                    marketplace,
+                    request.source,
+                    request.priority,
+                    request.product_query,
+                    request.recall_mode,
+                    request.category_id,
+                    request.category_path,
+                    request.include_descendants,
+                    request.target_asin_count,
+                    request.min_pool_size,
+                    status_reason,
+                    request.requested_by_session_id,
+                    request.requested_by_user_id,
+                    request.idempotency_key,
+                    tokens_estimated,
+                    psycopg2.extras.Json(meta_json),
+                ],
+            )
+
+        return {
+            "job": self._format_candidate_expansion_job(rows[0]),
+            "created": True,
+            "notes": [
+                "candidate expansion is queued; collector owns Keepa token reservation and execution",
+                "status will move through queued/waiting_token/discovering/hydrating/syncing/completed",
+            ],
+        }
+
+    def get_candidate_expansion_status(self, request: CandidateExpansionJobStatusRequest) -> dict[str, Any]:
+        domain, marketplace = _normalize_marketplace(request.marketplace)
+        with _postgres_conn() as conn:
+            if request.job_id:
+                rows = _run_pg_dict_query(
+                    conn,
+                    """
+                    SELECT *
+                    FROM sync.keepa_candidate_expansion_jobs
+                    WHERE job_id = %s
+                    LIMIT 1
+                    """,
+                    [request.job_id],
+                )
+            else:
+                rows = _run_pg_dict_query(
+                    conn,
+                    """
+                    SELECT *
+                    FROM sync.keepa_candidate_expansion_jobs
+                    WHERE domain = %s
+                      AND (%s::TEXT[] IS NULL OR status = ANY(%s::TEXT[]))
+                    ORDER BY
+                      CASE priority
+                        WHEN 'interactive_high' THEN 1
+                        WHEN 'interactive_normal' THEN 2
+                        WHEN 'background_high' THEN 3
+                        ELSE 4
+                      END,
+                      created_at ASC
+                    LIMIT %s
+                    """,
+                    [domain, request.statuses or None, request.statuses or None, request.limit],
+                )
+
+        jobs = [self._format_candidate_expansion_job(row) for row in rows]
+        return {
+            "marketplace": marketplace,
+            "domain": domain,
+            "job_id": request.job_id,
+            "job_count": len(jobs),
+            "jobs": jobs,
+            "notes": [
+                "queued and waiting_token jobs do not consume Keepa tokens until collector reserves them",
+                "completed jobs may require DuckDB-to-PostgreSQL sync before resolve_candidates sees new local candidates",
+            ],
         }
 
     def _normalize_top_feature_contributions(self, raw_value: Any) -> list[dict[str, Any]]:
@@ -1289,6 +2071,9 @@ class ProductThemeService:
         *,
         sql_prefilter_terms: list[str],
         sql_required_product_terms: list[str],
+        category_id: int | None,
+        category_path: str | None,
+        include_descendants: bool,
         active_only: bool,
         price_min: float | None,
         price_max: float | None,
@@ -1299,11 +2084,29 @@ class ProductThemeService:
             return _run_pg_dict_query(
                 conn,
                 """
-                WITH query_terms AS MATERIALIZED (
+                WITH RECURSIVE query_terms AS MATERIALIZED (
                     SELECT COALESCE(%s::TEXT[], ARRAY[]::TEXT[]) AS terms
                 ),
                 required_product_terms AS MATERIALIZED (
                     SELECT COALESCE(%s::TEXT[], ARRAY[]::TEXT[]) AS terms
+                ),
+                category_seed AS MATERIALIZED (
+                    SELECT %s::BIGINT AS category_id
+                ),
+                category_subtree(category_id) AS MATERIALIZED (
+                    SELECT category_id
+                    FROM category_seed
+                    WHERE category_id IS NOT NULL
+
+                    UNION
+
+                    SELECT child.category_id
+                    FROM sync.keepa_category_registry child
+                    JOIN category_subtree parent
+                      ON child.parent_id = parent.category_id
+                    WHERE child.domain = %s
+                      AND %s IS TRUE
+                      AND child.category_id <> parent.category_id
                 ),
                 matched_registry AS MATERIALIZED (
                     SELECT
@@ -1380,6 +2183,16 @@ class ProductThemeService:
                       AND (%s IS FALSE OR COALESCE(r.is_active, TRUE) = TRUE)
                       AND (%s::DOUBLE PRECISION IS NULL OR s.price IS NULL OR s.price >= %s::DOUBLE PRECISION)
                       AND (%s::DOUBLE PRECISION IS NULL OR s.price IS NULL OR s.price <= %s::DOUBLE PRECISION)
+                      AND (
+                          %s::BIGINT IS NULL
+                          OR r.category_id IN (SELECT category_id FROM category_subtree)
+                      )
+                      AND (
+                          %s::TEXT IS NULL
+                          OR %s::TEXT = ''
+                          OR LOWER(COALESCE(r.category_path, '')) = LOWER(%s::TEXT)
+                          OR (%s IS TRUE AND LOWER(COALESCE(r.category_path, '')) LIKE (LOWER(%s::TEXT) || ' > %%'))
+                      )
                       AND (
                           CARDINALITY((SELECT terms FROM query_terms)) = 0
                           OR q.text_match_score > 0
@@ -1458,12 +2271,21 @@ class ProductThemeService:
                 [
                     sql_prefilter_terms,
                     sql_required_product_terms,
+                    category_id,
+                    domain,
+                    include_descendants,
                     domain,
                     active_only,
                     price_min,
                     price_min,
                     price_max,
                     price_max,
+                    category_id,
+                    category_path,
+                    category_path,
+                    category_path,
+                    include_descendants,
+                    category_path,
                     prefilter_limit,
                     domain,
                     domain,
@@ -1490,16 +2312,23 @@ class ProductThemeService:
             normalization.category_hints,
         )
         required_product_terms = _build_required_product_terms(normalized_phrases, tokens)
-        sql_prefilter_terms = _build_sql_prefilter_terms(normalized_phrases, tokens)
-        sql_required_product_terms = _build_sql_prefilter_terms(required_product_terms, [], max_terms=12)
-        sql_prefilter_limit = _candidate_sql_prefilter_limit(request.max_candidates)
+        recall_mode = request.recall_mode
+        category_scope_applied = bool(request.category_id is not None or request.category_path)
+        category_only_recall = recall_mode == "category" and category_scope_applied
+        effective_sql_prefilter_terms = [] if category_only_recall else _build_sql_prefilter_terms(normalized_phrases, tokens)
+        effective_required_product_terms = [] if category_only_recall else required_product_terms
+        sql_required_product_terms = _build_sql_prefilter_terms(effective_required_product_terms, [], max_terms=12)
+        sql_prefilter_limit = _candidate_sql_prefilter_limit(max(request.max_candidates, request.target_pool_size))
 
         def run_domain_fetch() -> tuple[list[dict[str, Any]], int]:
             started_at = time.perf_counter()
             result = self._fetch_domain_candidates(
                 domain,
-                sql_prefilter_terms=sql_prefilter_terms,
+                sql_prefilter_terms=effective_sql_prefilter_terms,
                 sql_required_product_terms=sql_required_product_terms,
+                category_id=request.category_id,
+                category_path=request.category_path,
+                include_descendants=request.include_descendants,
                 active_only=request.active_only,
                 price_min=request.price_min,
                 price_max=request.price_max,
@@ -1548,7 +2377,11 @@ class ProductThemeService:
 
             score, reasons, breakdown = _score_candidate(record, normalized_phrases, tokens)
             if score <= 0:
-                continue
+                if not category_only_recall:
+                    continue
+                score = 1.0
+                reasons = ["category_scope_match"]
+                breakdown = {"category_scope_match": 1.0}
             root_category_name = _category_level_name(record.category_path, 0)
             category_l2_name = _category_level_name(record.category_path, 1)
             category_l3_name = _category_level_name(record.category_path, 2)
@@ -1595,7 +2428,7 @@ class ProductThemeService:
             if _candidate_field_matches_required_terms(
                 item,
                 ["leaf_category_name", "fine_category_name"],
-                required_product_terms,
+                effective_required_product_terms,
             )
         ]
         category_anchored_candidates = [
@@ -1603,8 +2436,8 @@ class ProductThemeService:
             for item in candidates
             if (item.get("match_breakdown") or {}).get("semantic_field_required_product_terms")
         ]
-        semantic_fine_category_anchor_applied = bool(required_product_terms and fine_category_anchored_candidates)
-        semantic_category_anchor_applied = bool(required_product_terms and (fine_category_anchored_candidates or category_anchored_candidates))
+        semantic_fine_category_anchor_applied = bool(effective_required_product_terms and fine_category_anchored_candidates)
+        semantic_category_anchor_applied = bool(effective_required_product_terms and (fine_category_anchored_candidates or category_anchored_candidates))
         if semantic_fine_category_anchor_applied:
             candidates = fine_category_anchored_candidates
         elif semantic_category_anchor_applied:
@@ -1625,23 +2458,79 @@ class ProductThemeService:
         recall_normalization = normalization.recall_normalization
         scoring_ms = int((time.perf_counter() - scoring_started_at) * 1000)
 
+        matched_leaf_categories = _category_distribution(candidate_items, "leaf_category_name")
+        matched_fine_categories = _category_distribution(candidate_items, "fine_category_name")
+        matched_root_categories = _category_distribution(candidate_items, "root_category_name")
+        pool_quality = _build_candidate_pool_quality(
+            candidate_items,
+            candidate_total_before_semantic_gate=len(rows),
+            candidate_total_before_category_anchor=candidate_total_before_semantic_category_anchor,
+            leaf_distribution=matched_leaf_categories,
+            fine_distribution=matched_fine_categories,
+            root_distribution=matched_root_categories,
+            min_pool_size=request.min_pool_size,
+            target_pool_size=request.target_pool_size,
+        )
+        normalized_query = normalized_phrases[0] if normalized_phrases else _normalize_text(normalization.product_query)
+        candidate_pool_id = str(uuid.uuid4())
+        candidate_pool_lineage = self._build_candidate_pool_lineage(
+            request=request,
+            marketplace=marketplace,
+            domain=domain,
+            normalized_query=normalized_query,
+            normalized_phrases=normalized_phrases,
+            tokens=tokens,
+            query_expansions=query_expansions,
+        )
+        candidate_pool_persistence = await asyncio.to_thread(
+            self._persist_candidate_pool,
+            candidate_pool_id=candidate_pool_id,
+            domain=domain,
+            marketplace=marketplace,
+            request=request,
+            normalized_query=normalized_query,
+            candidate_items=candidate_items,
+            candidate_total_before_truncate=len(candidates),
+            pool_quality=pool_quality,
+            lineage=candidate_pool_lineage,
+        )
+
         return {
             "marketplace": marketplace,
             "domain": domain,
+            "candidate_pool_id": candidate_pool_id,
+            "candidate_pool_version": 1,
+            "candidate_pool_lineage": candidate_pool_lineage,
+            "candidate_pool_persistence": candidate_pool_persistence,
             "raw_product_query": request.product_query,
-            "normalized_query": normalized_phrases[0] if normalized_phrases else _normalize_text(normalization.product_query),
+            "recall_mode": recall_mode,
+            "category_constraint": {
+                "applied": category_scope_applied,
+                "category_id": request.category_id,
+                "category_path": request.category_path,
+                "include_descendants": request.include_descendants,
+                "category_only_recall": category_only_recall,
+            },
+            "expand_if_small": request.expand_if_small,
+            "normalized_query": normalized_query,
             "query_phrases": normalized_phrases,
             "query_tokens": tokens,
             "query_expansions": query_expansions,
             "required_product_terms": required_product_terms,
+            "effective_required_product_terms": effective_required_product_terms,
             "ranking_policy": {
                 "primary_sort": ["match_score", "business_priority", "has_sales_signal_30d", "current_review_count"],
                 "sql_prefilter_sort": ["sql_prefilter_score", "business_priority", "current_review_count"],
                 "semantic_gate": "required_product_terms must match high-signal product fields before a candidate can enter the final pool",
                 "semantic_category_anchor": "when leaf/fine category anchors exist they are preferred; otherwise category/keyword anchored candidates exclude title-only matches",
+                "recall_modes": {
+                    "keyword": "default multi-field keyword recall over title/category/category_path/search_term/keyword",
+                    "hybrid": "apply category_id/category_path scope first, then keep keyword semantic gating inside that scope",
+                    "category": "apply category_id/category_path scope as the recall pool and use ranking boosters when keyword score is absent",
+                },
                 "match_score_components": ["phrase_score", "token_score", "business_score", "freshness_score", "completeness_score"],
                 "matched_fields": ["product_title", "category", "category_path", "leaf_category_name", "fine_category_name", "keywords"],
-                "note": "candidate filtering uses SQL lexical prefilter/coarse sort plus required product-term gating before Python exact scoring; product-specific core-vs-adjacent cleanup should use returned candidate_items fields or a downstream configurable classifier, not hard-coded product names",
+                "note": "candidate filtering uses SQL lexical/category prefilter plus required product-term gating before Python exact scoring; product-specific core-vs-adjacent cleanup should use returned candidate_items fields or a downstream configurable classifier, not hard-coded product names",
             },
             "timing_ms": {
                 "query_normalization": normalization_ms,
@@ -1697,16 +2586,18 @@ class ProductThemeService:
             "candidate_count": len(candidate_items),
             "candidate_total_before_truncate": len(candidates),
             "candidate_total_before_semantic_category_anchor": candidate_total_before_semantic_category_anchor,
+            "pool_quality": pool_quality,
             "semantic_fine_category_anchor_applied": semantic_fine_category_anchor_applied,
             "semantic_category_anchor_applied": semantic_category_anchor_applied,
             "candidate_sql_prefilter_count": sql_prefilter_total_count,
             "candidate_sql_prefilter_limit": sql_prefilter_limit,
             "candidate_sql_prefilter_truncated": sql_prefilter_total_count > sql_prefilter_limit,
+            "category_scope_applied": category_scope_applied,
             "truncated": truncated,
             "matched_categories": _unique_nonempty([item["category"] for item in candidate_items])[:10],
-            "matched_leaf_categories": _category_distribution(candidate_items, "leaf_category_name"),
-            "matched_fine_categories": _category_distribution(candidate_items, "fine_category_name"),
-            "matched_root_categories": _category_distribution(candidate_items, "root_category_name"),
+            "matched_leaf_categories": matched_leaf_categories,
+            "matched_fine_categories": matched_fine_categories,
+            "matched_root_categories": matched_root_categories,
             "matched_keywords": _unique_nonempty([keyword for item in candidate_items for keyword in item["keywords"]])[:20],
             "candidate_asins": [item["asin"] for item in candidate_items],
             "candidate_items": candidate_items,
@@ -1714,6 +2605,8 @@ class ProductThemeService:
                 "when configured, recall preparation now runs as two internal stages: theme extraction first, then recall normalization",
                 "the external resolve_candidates tool surface stays merged; only the internal service layer is split into extraction and normalization",
                 "candidate pool is resolved by multi-field recall over title/category/category_path/search_term/keyword with required product-term gating",
+                "category/hybrid recall can constrain the pool by category_id and/or category_path before scoring; category-only mode is suitable for补池 or broad category coverage checks",
+                "expand_if_small is accepted as a planning signal; online Keepa token-consuming expansion is handled by the collection layer rather than this local resolver",
                 "SQL prefilter narrows the domain candidate set before Python exact scoring, so downstream tools should rely on returned candidate_asins rather than re-scanning visible titles",
                 "leaf_category_name and fine_category_name are preferred for product analysis; root/L2/L3 categories can be too coarse for candidate cleanup",
                 "built-in Chinese-to-English query expansion remains as a fallback bridge for common product terms when source data is English-dominant",
@@ -1723,7 +2616,11 @@ class ProductThemeService:
 
     def get_candidate_pool_stats(self, request: CandidatePoolRequest) -> dict[str, Any]:
         domain, marketplace = _normalize_marketplace(request.marketplace)
-        candidate_asins = _sanitize_asins(request.candidate_asins)
+        candidate_asins, candidate_pool_ref = self._resolve_candidate_asins_for_pool_request(
+            request,
+            domain=domain,
+            marketplace=marketplace,
+        )
         effective_window_days = _effective_feature_window_days(request.window_days)
 
         with _postgres_conn() as conn:
@@ -1877,6 +2774,7 @@ class ProductThemeService:
         return {
             "marketplace": marketplace,
             "domain": domain,
+            "candidate_pool": candidate_pool_ref,
             "window_days": effective_window_days,
             "candidate_count": int(stats.get("candidate_count") or 0),
             "sales_window_sum": round(float(stats.get("sales_window_sum") or 0.0), 2),
@@ -1903,7 +2801,11 @@ class ProductThemeService:
 
     def get_candidate_pool_trends(self, request: CandidatePoolRequest) -> dict[str, Any]:
         domain, marketplace = _normalize_marketplace(request.marketplace)
-        candidate_asins = _sanitize_asins(request.candidate_asins)
+        candidate_asins, candidate_pool_ref = self._resolve_candidate_asins_for_pool_request(
+            request,
+            domain=domain,
+            marketplace=marketplace,
+        )
         effective_window_days = _effective_feature_window_days(request.window_days)
 
         with _postgres_conn() as conn:
@@ -1962,6 +2864,7 @@ class ProductThemeService:
         return {
             "marketplace": marketplace,
             "domain": domain,
+            "candidate_pool": candidate_pool_ref,
             "data_source": "google_trends",
             "source_table": "serving.theme_trends_daily",
             "window_days": effective_window_days,
@@ -1983,7 +2886,11 @@ class ProductThemeService:
 
     def get_candidate_pool_weak_forecast(self, request: WeakForecastRequest) -> dict[str, Any]:
         domain, marketplace = _normalize_marketplace(request.marketplace)
-        candidate_asins = _sanitize_asins(request.candidate_asins)
+        candidate_asins, candidate_pool_ref = self._resolve_candidate_asins_for_pool_request(
+            request,
+            domain=domain,
+            marketplace=marketplace,
+        )
         effective_window_days = max(30, _effective_feature_window_days(request.window_days))
 
         with _postgres_conn() as conn:
@@ -2137,6 +3044,7 @@ class ProductThemeService:
         return {
             "marketplace": marketplace,
             "domain": domain,
+            "candidate_pool": candidate_pool_ref,
             "forecast_type": "heuristic_v1",
             "window_days": effective_window_days,
             "bullish_asin_count": bullish_count,
@@ -2152,7 +3060,11 @@ class ProductThemeService:
 
     def get_top_asin_drilldown(self, request: DrilldownRequest) -> dict[str, Any]:
         domain, marketplace = _normalize_marketplace(request.marketplace)
-        candidate_asins = _sanitize_asins(request.candidate_asins)
+        candidate_asins, candidate_pool_ref = self._resolve_candidate_asins_for_pool_request(
+            request,
+            domain=domain,
+            marketplace=marketplace,
+        )
         if request.top_n is not None:
             candidate_asins = candidate_asins[: request.top_n]
         effective_window_days = _effective_feature_window_days(request.window_days)
@@ -2311,6 +3223,7 @@ class ProductThemeService:
         return {
             "marketplace": marketplace,
             "domain": domain,
+            "candidate_pool": candidate_pool_ref,
             "window_days": effective_window_days,
             "sales_forecast_meta": sales_forecast_meta,
             "items": enriched_rows,
@@ -2617,6 +3530,192 @@ class ProductThemeService:
     def _extract_leaf_category_name(self, category_path: Any, fallback_category: Any = None) -> str | None:
         return _leaf_category_name(category_path, fallback_category)
 
+    def _benchmark_target_depth(self, benchmark_level: str) -> int | None:
+        return {
+            "root": 1,
+            "l1": 1,
+            "l2": 2,
+            "l3": 3,
+        }.get((benchmark_level or "auto").strip().lower())
+
+    def _fetch_category_benchmark_anchor(
+        self,
+        conn,
+        *,
+        domain: int,
+        benchmark_category_id: int | None,
+        benchmark_category_path: str | None,
+        benchmark_level: str,
+    ) -> dict[str, Any] | None:
+        if benchmark_category_id is None and not benchmark_category_path:
+            return None
+
+        target_depth = self._benchmark_target_depth(benchmark_level)
+        rows = _run_pg_dict_query(
+            conn,
+            """
+            WITH RECURSIVE category_tree AS (
+                SELECT
+                    c.category_id,
+                    c.domain,
+                    c.category_en,
+                    c.category_cn,
+                    c.parent_id,
+                    c.depth,
+                    c.product_count,
+                    COALESCE(c.category_en, '')::text AS category_path
+                FROM sync.keepa_category_registry c
+                WHERE c.domain = %s
+                  AND (c.parent_id IS NULL OR c.depth = 1)
+
+                UNION ALL
+
+                SELECT
+                    child.category_id,
+                    child.domain,
+                    child.category_en,
+                    child.category_cn,
+                    child.parent_id,
+                    child.depth,
+                    child.product_count,
+                    CONCAT_WS(' > ', NULLIF(parent.category_path, ''), child.category_en)::text AS category_path
+                FROM sync.keepa_category_registry child
+                JOIN category_tree parent
+                  ON child.domain = parent.domain
+                 AND child.parent_id = parent.category_id
+                WHERE child.category_id <> parent.category_id
+            ),
+            selected AS (
+                SELECT
+                    t.*,
+                    CASE
+                        WHEN %s::BIGINT IS NOT NULL AND t.category_id = %s::BIGINT THEN 0
+                        WHEN %s::TEXT IS NOT NULL AND %s::TEXT <> '' AND LOWER(t.category_path) = LOWER(%s::TEXT) THEN 1
+                        WHEN %s::TEXT IS NOT NULL AND %s::TEXT <> '' AND LOWER(COALESCE(t.category_en, '')) = LOWER(%s::TEXT) THEN 2
+                        WHEN %s::TEXT IS NOT NULL AND %s::TEXT <> '' AND LOWER(COALESCE(t.category_cn, '')) = LOWER(%s::TEXT) THEN 3
+                        ELSE 4
+                    END AS match_rank
+                FROM category_tree t
+                WHERE (%s::BIGINT IS NOT NULL AND t.category_id = %s::BIGINT)
+                   OR (
+                       %s::TEXT IS NOT NULL
+                       AND %s::TEXT <> ''
+                       AND (
+                           LOWER(t.category_path) = LOWER(%s::TEXT)
+                           OR LOWER(COALESCE(t.category_en, '')) = LOWER(%s::TEXT)
+                           OR LOWER(COALESCE(t.category_cn, '')) = LOWER(%s::TEXT)
+                           OR LOWER(t.category_path) LIKE ('%%' || LOWER(%s::TEXT) || '%%')
+                       )
+                   )
+                ORDER BY match_rank ASC, t.depth DESC, t.product_count DESC NULLS LAST
+                LIMIT 1
+            ),
+            ancestors AS (
+                SELECT
+                    s.category_id,
+                    s.category_en,
+                    s.category_cn,
+                    s.parent_id,
+                    s.depth,
+                    s.product_count,
+                    s.category_path
+                FROM selected s
+
+                UNION ALL
+
+                SELECT
+                    parent.category_id,
+                    parent.category_en,
+                    parent.category_cn,
+                    parent.parent_id,
+                    parent.depth,
+                    parent.product_count,
+                    parent.category_path
+                FROM ancestors child
+                JOIN category_tree parent
+                  ON child.parent_id = parent.category_id
+            )
+            SELECT
+                a.category_id,
+                a.category_en,
+                a.category_cn,
+                a.parent_id,
+                a.depth,
+                a.product_count,
+                a.category_path,
+                (a.category_id = (SELECT category_id FROM selected)) AS is_selected_category
+            FROM ancestors a
+            ORDER BY
+                CASE
+                    WHEN %s::INTEGER IS NOT NULL AND a.depth = %s::INTEGER THEN 0
+                    WHEN a.category_id = (SELECT category_id FROM selected) THEN 1
+                    ELSE 2
+                END ASC,
+                a.depth DESC
+            LIMIT 1
+            """,
+            [
+                domain,
+                benchmark_category_id,
+                benchmark_category_id,
+                benchmark_category_path,
+                benchmark_category_path,
+                benchmark_category_path,
+                benchmark_category_path,
+                benchmark_category_path,
+                benchmark_category_path,
+                benchmark_category_path,
+                benchmark_category_path,
+                benchmark_category_path,
+                benchmark_category_id,
+                benchmark_category_id,
+                benchmark_category_path,
+                benchmark_category_path,
+                benchmark_category_path,
+                benchmark_category_path,
+                benchmark_category_path,
+                benchmark_category_path,
+                target_depth,
+                target_depth,
+            ],
+        )
+        return rows[0] if rows else None
+
+    def _count_candidate_asins_in_category(
+        self,
+        conn,
+        *,
+        domain: int,
+        candidate_asins: list[str],
+        category_id: int,
+        include_descendants: bool,
+    ) -> int:
+        rows = _run_pg_dict_query(
+            conn,
+            """
+            WITH RECURSIVE subtree(category_id) AS (
+                SELECT %s::BIGINT AS category_id
+
+                UNION
+
+                SELECT child.category_id
+                FROM sync.keepa_category_registry child
+                JOIN subtree parent
+                  ON child.parent_id = parent.category_id
+                WHERE child.domain = %s
+                  AND %s IS TRUE
+                  AND child.category_id <> parent.category_id
+            )
+            SELECT COUNT(DISTINCT r.asin) AS candidate_asin_count
+            FROM sync.keepa_asin_registry r
+            WHERE r.domain = %s
+              AND r.asin = ANY(%s)
+              AND r.category_id IN (SELECT category_id FROM subtree)
+            """,
+            [category_id, domain, include_descendants, domain, candidate_asins],
+        )
+        return int(rows[0].get("candidate_asin_count") or 0) if rows else 0
+
     def _build_asin_history_window_summary(self, rows: list[dict[str, Any]], interval: str, window_days: int) -> dict[str, Any] | None:
         if not rows:
             return None
@@ -2653,24 +3752,88 @@ class ProductThemeService:
             return value.strftime("%Y-%m-%d")
         return str(value)
 
-    def get_category_benchmark(self, request: CandidatePoolRequest) -> dict[str, Any]:
+    def get_category_benchmark(self, request: CategoryBenchmarkRequest) -> dict[str, Any]:
         """Return L3-level category benchmark stats for comparison with candidate pool.
 
         Strategy:
-        1. Get each candidate ASIN's leaf category_id from keepa_asin_registry
-        2. Walk up parent_id chain in keepa_category_registry to find L3 ancestor (depth=3)
-        3. Pick the dominant L3 category (mode) as the benchmark anchor
-        4. Aggregate all ASINs whose category_id descends from that L3 node
+        1. Use explicit benchmark_category_id/path when provided.
+        2. Otherwise get each candidate ASIN's leaf category_id from keepa_asin_registry.
+        3. Walk up parent_id chain in keepa_category_registry to find L3 ancestor (depth=3).
+        4. Pick the dominant L3 category (mode) as the benchmark anchor.
+        5. Aggregate ASINs whose category_id descends from the anchor.
         """
         domain, marketplace = _normalize_marketplace(request.marketplace)
-        candidate_asins = _sanitize_asins(request.candidate_asins)
+        candidate_asins, candidate_pool_ref = self._resolve_candidate_asins_for_pool_request(
+            request,
+            domain=domain,
+            marketplace=marketplace,
+        )
         effective_window_days = min(request.window_days, 90)
+        explicit_anchor_requested = bool(request.benchmark_category_id is not None or request.benchmark_category_path)
+        anchor_source = "auto_candidate_l3_mode"
+        anchor_confidence = 0.0
+        fallback_reason: str | None = None
+        all_l3_cats: list[dict[str, Any]] = []
 
         with _postgres_conn() as conn:
-            # ── Step 1+2: resolve each candidate ASIN's L3 ancestor category ──
-            l3_rows = _run_pg_dict_query(
+            explicit_anchor = self._fetch_category_benchmark_anchor(
                 conn,
-                """
+                domain=domain,
+                benchmark_category_id=request.benchmark_category_id,
+                benchmark_category_path=request.benchmark_category_path,
+                benchmark_level=request.benchmark_level,
+            )
+            if explicit_anchor:
+                dominant_l3_id = int(explicit_anchor["category_id"])
+                dominant_l3_name = str(
+                    explicit_anchor.get("category_cn") or explicit_anchor.get("category_en") or "Unknown"
+                )
+                dominant_l3_en = str(explicit_anchor.get("category_en") or "")
+                dominant_depth = int(explicit_anchor.get("depth") or 0)
+                dominant_count = self._count_candidate_asins_in_category(
+                    conn,
+                    domain=domain,
+                    candidate_asins=candidate_asins,
+                    category_id=dominant_l3_id,
+                    include_descendants=request.include_descendants,
+                )
+                anchor_source = "explicit_category_id" if request.benchmark_category_id is not None else "explicit_category_path"
+                anchor_confidence = 0.98 if request.benchmark_category_id is not None else 0.9
+                target_depth = self._benchmark_target_depth(request.benchmark_level)
+                if target_depth is not None and dominant_depth != target_depth:
+                    fallback_reason = f"requested benchmark_level={request.benchmark_level} but resolved anchor depth is L{dominant_depth}"
+            else:
+                if explicit_anchor_requested:
+                    return {
+                        "marketplace": marketplace,
+                        "domain": domain,
+                        "candidate_pool": candidate_pool_ref,
+                        "window_days": request.window_days,
+                        "benchmark_category": None,
+                        "benchmark_category_level": None,
+                        "benchmark_anchor": None,
+                        "anchor_source": "explicit_anchor_not_found",
+                        "anchor_confidence": 0.0,
+                        "fallback_reason": "benchmark_category_id/path did not match local keepa_category_registry",
+                        "benchmark_is_precise": False,
+                        "local_category_coverage": {
+                            "candidate_asin_count_in_category": 0,
+                            "category_total_asin_count": 0,
+                            "too_small": True,
+                            "min_pool_size": DEFAULT_MIN_CANDIDATE_POOL_SIZE,
+                        },
+                        "candidate_asin_count_in_category": 0,
+                        "category_total_asin_count": 0,
+                        "candidate_category_coverage_pct": 0,
+                        "all_candidate_l3_categories": [],
+                        "benchmark_stats": {},
+                        "notes": ["显式 benchmark 类目锚点未在本地类目表中命中"],
+                    }
+
+            # ── Step 1+2: resolve each candidate ASIN's L3 ancestor category ──
+                l3_rows = _run_pg_dict_query(
+                    conn,
+                    """
                 WITH RECURSIVE
                 candidate_leaf AS (
                     SELECT asin, category_id
@@ -2732,53 +3895,65 @@ class ProductThemeService:
                       SELECT asin FROM ancestors WHERE depth = 3
                   )
                 """,
-                [domain, candidate_asins, domain, domain, domain],
-            )
+                    [domain, candidate_asins, domain, domain, domain],
+                )
 
-        if not l3_rows:
-            return {
-                "marketplace": marketplace,
-                "domain": domain,
-                "window_days": request.window_days,
-                "benchmark_category": None,
-                "benchmark_category_level": None,
-                "candidate_asin_count_in_category": 0,
-                "category_total_asin_count": 0,
-                "candidate_category_coverage_pct": 0,
-                "all_candidate_l3_categories": [],
-                "benchmark_stats": {},
-                "notes": ["未能从候选池 ASIN 的类目信息中解析出 L3 类目"],
-            }
+                if not l3_rows:
+                    return {
+                        "marketplace": marketplace,
+                        "domain": domain,
+                        "window_days": request.window_days,
+                        "benchmark_category": None,
+                        "benchmark_category_level": None,
+                        "benchmark_anchor": None,
+                        "anchor_source": anchor_source,
+                        "anchor_confidence": 0.0,
+                        "fallback_reason": "candidate_asins do not have local category_id coverage",
+                        "benchmark_is_precise": False,
+                        "local_category_coverage": {
+                            "candidate_asin_count_in_category": 0,
+                            "category_total_asin_count": 0,
+                            "too_small": True,
+                            "min_pool_size": DEFAULT_MIN_CANDIDATE_POOL_SIZE,
+                        },
+                        "candidate_asin_count_in_category": 0,
+                        "category_total_asin_count": 0,
+                        "candidate_category_coverage_pct": 0,
+                        "all_candidate_l3_categories": [],
+                        "benchmark_stats": {},
+                        "notes": ["未能从候选池 ASIN 的类目信息中解析出 L3 类目"],
+                    }
 
-        # ── Step 3: pick dominant L3 category (mode) ──
-        from collections import Counter
-        l3_counter: Counter[int] = Counter()
-        l3_name_map: dict[int, str] = {}
-        l3_en_map: dict[int, str] = {}
-        l3_depth_map: dict[int, int] = {}
-        for row in l3_rows:
-            cat_id = int(row["l3_category_id"])
-            l3_counter[cat_id] += 1
-            l3_name_map[cat_id] = row["l3_category_name"]
-            l3_en_map[cat_id] = row.get("l3_category_en") or ""
-            l3_depth_map[cat_id] = int(row["depth"])
+                # ── Step 3: pick dominant L3 category (mode) ──
+                from collections import Counter
+                l3_counter: Counter[int] = Counter()
+                l3_name_map: dict[int, str] = {}
+                l3_en_map: dict[int, str] = {}
+                l3_depth_map: dict[int, int] = {}
+                for row in l3_rows:
+                    cat_id = int(row["l3_category_id"])
+                    l3_counter[cat_id] += 1
+                    l3_name_map[cat_id] = row["l3_category_name"]
+                    l3_en_map[cat_id] = row.get("l3_category_en") or ""
+                    l3_depth_map[cat_id] = int(row["depth"])
 
-        dominant_l3_id, dominant_count = l3_counter.most_common(1)[0]
-        dominant_l3_name = l3_name_map[dominant_l3_id]
-        dominant_l3_en = l3_en_map[dominant_l3_id]
-        dominant_depth = l3_depth_map[dominant_l3_id]
+                dominant_l3_id, dominant_count = l3_counter.most_common(1)[0]
+                dominant_l3_name = l3_name_map[dominant_l3_id]
+                dominant_l3_en = l3_en_map[dominant_l3_id]
+                dominant_depth = l3_depth_map[dominant_l3_id]
+                anchor_confidence = round(dominant_count / max(len(candidate_asins), 1), 4)
 
-        # all L3 categories for transparency
-        all_l3_cats = [
-            {
-                "l3_category_id": cat_id,
-                "l3_category_name": l3_name_map[cat_id],
-                "l3_category_en": l3_en_map[cat_id],
-                "depth": l3_depth_map[cat_id],
-                "candidate_asin_count": count,
-            }
-            for cat_id, count in l3_counter.most_common()
-        ]
+                # all L3 categories for transparency
+                all_l3_cats = [
+                    {
+                        "l3_category_id": cat_id,
+                        "l3_category_name": l3_name_map[cat_id],
+                        "l3_category_en": l3_en_map[cat_id],
+                        "depth": l3_depth_map[cat_id],
+                        "candidate_asin_count": count,
+                    }
+                    for cat_id, count in l3_counter.most_common()
+                ]
 
         # ── Step 4: find all ASINs that descend from the dominant L3 category ──
         # Use recursive CTE to get all descendant category_ids under dominant L3
@@ -2798,6 +3973,8 @@ class ProductThemeService:
                     FROM sync.keepa_category_registry c
                     JOIN subtree s ON c.parent_id = s.category_id
                     WHERE c.domain = %s
+                                            AND %s IS TRUE
+                                            AND c.category_id <> s.category_id
                 ),
                 category_asins AS (
                     SELECT r.asin
@@ -2840,7 +4017,7 @@ class ProductThemeService:
                     PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY offer_count) AS median_offer_count
                 FROM latest_history
                 """,
-                [dominant_l3_id, domain, domain, domain, domain, effective_window_days],
+                [dominant_l3_id, domain, domain, request.include_descendants, domain, domain, effective_window_days],
             )
 
         def _safe_round(val: Any, decimals: int = 2) -> float | None:
@@ -2851,6 +4028,15 @@ class ProductThemeService:
 
         stats = bench_rows[0] if bench_rows else {}
         cat_total = int(stats.get("category_total_asin_count") or 0)
+        local_category_coverage = {
+            "candidate_asin_count_in_category": dominant_count,
+            "category_total_asin_count": cat_total,
+            "candidate_category_coverage_pct": round(dominant_count / cat_total * 100, 2) if cat_total > 0 else 0,
+            "too_small": cat_total < DEFAULT_MIN_CANDIDATE_POOL_SIZE,
+            "min_pool_size": DEFAULT_MIN_CANDIDATE_POOL_SIZE,
+            "include_descendants": request.include_descendants,
+        }
+        benchmark_is_precise = dominant_depth >= 3 and not local_category_coverage["too_small"]
 
         benchmark_stats = {
             "avg_price": _safe_round(stats.get("avg_price")),
@@ -2877,6 +4063,7 @@ class ProductThemeService:
         return {
             "marketplace": marketplace,
             "domain": domain,
+            "candidate_pool": candidate_pool_ref,
             "window_days": effective_window_days,
             "benchmark_category": {
                 "category_id": dominant_l3_id,
@@ -2886,17 +4073,35 @@ class ProductThemeService:
                 "level": f"L{dominant_depth}",
             },
             "benchmark_category_level": f"L{dominant_depth}",
+            "benchmark_anchor": {
+                "category_id": dominant_l3_id,
+                "category_name": dominant_l3_name,
+                "category_en": dominant_l3_en,
+                "depth": dominant_depth,
+                "level": f"L{dominant_depth}",
+                "requested_level": request.benchmark_level,
+                "include_descendants": request.include_descendants,
+            },
+            "anchor_source": anchor_source,
+            "anchor_confidence": anchor_confidence,
+            "fallback_reason": fallback_reason,
+            "benchmark_is_precise": benchmark_is_precise,
+            "local_category_coverage": local_category_coverage,
             "candidate_asin_count_in_category": dominant_count,
             "category_total_asin_count": cat_total,
-            "candidate_category_coverage_pct": round(
-                dominant_count / cat_total * 100, 2
-            ) if cat_total > 0 else 0,
+            "candidate_category_coverage_pct": local_category_coverage["candidate_category_coverage_pct"],
             "all_candidate_l3_categories": all_l3_cats,
             "benchmark_stats": benchmark_stats,
             "notes": [
-                f"对标类目由候选池 ASIN 的众数 L{dominant_depth} 类目自动选取",
+                (
+                    f"对标类目由显式 {anchor_source} 选取"
+                    if explicit_anchor_requested
+                    else f"对标类目由候选池 ASIN 的众数 L{dominant_depth} 类目自动选取"
+                ),
                 f"候选池中 {dominant_count}/{len(candidate_asins)} 个 ASIN 属于此类目",
-                "聚合范围包含该 L3 类目及其所有子类目下的全部 ASIN",
+                "聚合范围包含锚点类目及其所有子类目下的全部 ASIN" if request.include_descendants else "聚合范围仅包含锚点类目本身",
+                *( ["本地类目覆盖不足，benchmark 不应作为强品类结论"] if local_category_coverage["too_small"] else [] ),
+                *( [fallback_reason] if fallback_reason else [] ),
                 *( ["当前 benchmark 读取 PostgreSQL sync.keepa_product_history，在线窗口上限为近 90 天"] if request.window_days > effective_window_days else [] ),
             ],
         }
@@ -3186,6 +4391,33 @@ async def resolve_candidates(request: ResolveCandidatesRequest) -> dict[str, Any
     )
 
 
+@app.post("/api/product-theme/category-resolve")
+def category_resolve(request: CategoryResolveRequest) -> dict[str, Any]:
+    return _success_response(
+        endpoint="/api/product-theme/category-resolve",
+        message="category matches resolved",
+        data=service.resolve_category(request),
+    )
+
+
+@app.post("/api/product-theme/expand-candidates")
+def expand_candidates(request: CandidateExpansionJobRequest) -> dict[str, Any]:
+    return _success_response(
+        endpoint="/api/product-theme/expand-candidates",
+        message="candidate expansion job queued",
+        data=service.create_candidate_expansion_job(request),
+    )
+
+
+@app.post("/api/product-theme/candidate-expansion-status")
+def candidate_expansion_status(request: CandidateExpansionJobStatusRequest) -> dict[str, Any]:
+    return _success_response(
+        endpoint="/api/product-theme/candidate-expansion-status",
+        message="candidate expansion job status ready",
+        data=service.get_candidate_expansion_status(request),
+    )
+
+
 @app.post("/api/product-theme/candidate-pool-stats")
 def candidate_pool_stats(request: CandidatePoolRequest) -> dict[str, Any]:
     return _success_response(
@@ -3232,7 +4464,7 @@ def asin_history_timeseries(request: AsinHistoryTimeseriesRequest) -> dict[str, 
 
 
 @app.post("/api/product-theme/category-benchmark")
-def category_benchmark(request: CandidatePoolRequest) -> dict[str, Any]:
+def category_benchmark(request: CategoryBenchmarkRequest) -> dict[str, Any]:
     return _success_response(
         endpoint="/api/product-theme/category-benchmark",
         message="category benchmark ready",
