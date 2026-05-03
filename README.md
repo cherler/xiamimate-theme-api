@@ -50,3 +50,8 @@ PostgreSQL DDL：
 1. 在线查询当前为 PostgreSQL-only；health 不再暴露陈旧 DuckDB `source_db` 字段。
 2. 旧仓路径目前仅保留兼容 symlink，正式运行应以 shared runtime 路径为准。
 3. `resolve_candidates` 对外仍保持单一工具入口，但内部查询准备已拆为“主题抽取”与“召回归一化”两个阶段，便于后续独立观测和调优 canonical query、aliases、category hints 的生成质量。
+4. 机会发现 MVP 已提供 `POST /api/product-theme/opportunity-discovery`：
+   - 有 `query` 时复用 `resolve_candidates`、candidate pool stats/trends/weak forecast/category benchmark 生成单张机会卡。
+   - 无 `query` 时基于本地 `serving.theme_cross_daily` 与 `sync.keepa_asin_registry` 聚合类目机会卡。
+   - 当前为本地只读能力，不在 Theme API 内消费 Keepa token；返回的 `next_action` 可继续进入 quick report 或商品主题分析。
+5. 模型预测解释工具已提供 `POST /api/product-theme/product-forecast-explain`：复用 Top ASIN 下钻的 serving forecast 字段，返回 `asin_forecast_explanations`、`forecast_status`、`forecast_model_summary_text` 和 `driver_summary_text`，用于报告和 OpenWebUI 工具的正式模型预测口径。

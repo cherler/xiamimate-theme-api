@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import unittest
+from unittest.mock import patch
+
+from fastapi import HTTPException
 
 from data_platform.api.product_theme_api import (
     CandidateRecord,
@@ -8,6 +12,8 @@ from data_platform.api.product_theme_api import (
     CandidatePoolRequest,
     CandidateExpansionJobRequest,
     CandidateExpansionJobStatusRequest,
+    OpportunityDiscoveryRequest,
+    ProductForecastExplainRequest,
     ProductThemeService,
     ResolveCandidatesRequest,
     _build_query_variants,
@@ -347,11 +353,191 @@ class CandidateSemanticRecallTests(unittest.TestCase):
         self.assertEqual(request.category_path, "Home & Kitchen > Humidifiers")
         self.assertEqual(request.idempotency_key, "req-1")
 
+    def test_candidate_expansion_rejects_category_path_without_id(self) -> None:
+        service = ProductThemeService()
+        request = CandidateExpansionJobRequest(
+            product_query="humidifier",
+            recall_mode="hybrid",
+            category_path="Home & Kitchen > Humidifiers",
+        )
+
+        with self.assertRaises(HTTPException) as context:
+            service.create_candidate_expansion_job(request)
+
+        self.assertEqual(context.exception.status_code, 400)
+        self.assertIn("category_id", str(context.exception.detail))
+
+    def test_candidate_expansion_rejects_category_recall_without_id(self) -> None:
+        service = ProductThemeService()
+        request = CandidateExpansionJobRequest(product_query="humidifier", recall_mode="category")
+
+        with self.assertRaises(HTTPException) as context:
+            service.create_candidate_expansion_job(request)
+
+        self.assertEqual(context.exception.status_code, 400)
+        self.assertIn("category_id", str(context.exception.detail))
+
+    def test_candidate_expansion_category_lock_key_is_stable(self) -> None:
+        service = ProductThemeService()
+
+        lock_key = service._candidate_expansion_category_lock_key(
+            domain=1,
+            category_id=12345,
+            include_descendants=True,
+        )
+
+        self.assertEqual(lock_key, "candidate-expansion:domain:1:category:12345:desc:1")
+
+    def test_candidate_expansion_reuses_active_category_job(self) -> None:
+        service = ProductThemeService()
+        request = CandidateExpansionJobRequest(product_query="humidifier", category_id=12345)
+        queries: list[str] = []
+
+        existing_row = {
+            "job_id": "kexp_existing",
+            "marketplace": "US",
+            "domain": 1,
+            "source": "agent_interactive",
+            "priority": "interactive_normal",
+            "product_query": "humidifier",
+            "recall_mode": "hybrid",
+            "category_id": 12345,
+            "category_path": None,
+            "include_descendants": True,
+            "target_asin_count": 20,
+            "min_pool_size": 8,
+            "status": "hydrating",
+            "status_reason": "existing active job",
+            "requested_by_session_id": None,
+            "requested_by_user_id": None,
+            "tokens_estimated": 90,
+            "tokens_reserved": 0,
+            "tokens_consumed": 0,
+            "token_wait_until": None,
+            "result_candidate_asins": [],
+            "result_new_asin_count": 0,
+            "error_message": None,
+            "created_at": None,
+            "updated_at": None,
+            "started_at": None,
+            "finished_at": None,
+            "meta_json": {},
+        }
+
+        def fake_query(_conn: object, sql: str, _params: list[object] | None = None) -> list[dict]:
+            queries.append(sql)
+            if "pg_advisory_lock" in sql or "pg_advisory_unlock" in sql:
+                return [{}]
+            if "status = ANY" in sql:
+                return [existing_row]
+            return []
+
+        with patch("data_platform.api.product_theme_api._postgres_conn", return_value=contextlib.nullcontext(object())):
+            with patch("data_platform.api.product_theme_api._run_pg_dict_query", side_effect=fake_query):
+                result = service.create_candidate_expansion_job(request)
+
+        self.assertFalse(result["created"])
+        self.assertEqual(result["job"]["job_id"], "kexp_existing")
+        self.assertFalse(any("INSERT INTO sync.keepa_candidate_expansion_jobs" in sql for sql in queries))
+
     def test_candidate_expansion_status_request_accepts_csv_statuses(self) -> None:
         request = CandidateExpansionJobStatusRequest(statuses="queued, waiting_token", limit=5)
 
         self.assertEqual(request.statuses, ["queued", "waiting_token"])
         self.assertEqual(request.limit, 5)
+
+    def test_candidate_expansion_readiness_distinguishes_serving_pending(self) -> None:
+        service = ProductThemeService()
+        job = {
+            "result_candidate_asins": ["B000000001", "B000000002", "B000000003"],
+            "min_pool_size": 8,
+        }
+
+        readiness = service._build_candidate_expansion_data_readiness(
+            job,
+            {
+                "registry_hit_count": 3,
+                "snapshot_hit_count": 3,
+                "history_hit_count": 3,
+                "history_row_count": 270,
+                "serving_base_hit_count": 0,
+                "serving_base_row_count": 0,
+            },
+        )
+
+        self.assertTrue(readiness["registry_ready"])
+        self.assertTrue(readiness["hydration_ready"])
+        self.assertFalse(readiness["analysis_ready"])
+        self.assertEqual(readiness["readiness_status"], "serving_sync_pending")
+
+    def test_candidate_expansion_readiness_marks_analysis_ready_after_serving_sync(self) -> None:
+        service = ProductThemeService()
+        job = {
+            "result_candidate_asins": ["B000000001", "B000000002", "B000000003"],
+            "min_pool_size": 8,
+        }
+
+        readiness = service._build_candidate_expansion_data_readiness(
+            job,
+            {
+                "registry_hit_count": 3,
+                "snapshot_hit_count": 3,
+                "history_hit_count": 3,
+                "history_row_count": 270,
+                "serving_base_hit_count": 3,
+                "serving_base_row_count": 90,
+            },
+        )
+
+        self.assertTrue(readiness["serving_ready"])
+        self.assertTrue(readiness["analysis_ready"])
+        self.assertEqual(readiness["readiness_status"], "analysis_ready")
+
+    def test_opportunity_discovery_request_normalizes_controls(self) -> None:
+        request = OpportunityDiscoveryRequest(
+            marketplace="us",
+            platform="amazon",
+            query="  humidifier  ",
+            category_path="  Home & Kitchen > Humidifiers  ",
+            min_data_confidence="MEDIUM",
+            limit=5,
+        )
+
+        self.assertEqual(request.marketplace, "us")
+        self.assertEqual(request.platform, "Amazon")
+        self.assertEqual(request.query, "humidifier")
+        self.assertEqual(request.category_path, "Home & Kitchen > Humidifiers")
+        self.assertEqual(request.min_data_confidence, "medium")
+
+    def test_opportunity_discovery_request_rejects_non_amazon_platform(self) -> None:
+        with self.assertRaises(ValueError):
+            OpportunityDiscoveryRequest(platform="TikTok")
+
+    def test_product_forecast_explain_request_defaults_to_top_10(self) -> None:
+        request = ProductForecastExplainRequest(candidate_asins=["B001", "B002"], marketplace="US")
+
+        self.assertEqual(request.top_n, 10)
+        self.assertEqual(request.candidate_asins, ["B001", "B002"])
+
+    def test_product_forecast_explain_request_rejects_large_top_n(self) -> None:
+        with self.assertRaises(ValueError):
+            ProductForecastExplainRequest(candidate_asins=["B001"], top_n=30)
+
+    def test_opportunity_score_uses_design_weights(self) -> None:
+        service = ProductThemeService()
+        score = service._build_opportunity_score(
+            {
+                "demand_score": 100,
+                "trend_score": 80,
+                "competition_headroom_score": 60,
+                "price_fit_score": 100,
+                "forecast_growth_score": 40,
+                "coverage_gap_score": 50,
+                "evidence_quality_score": 80,
+            }
+        )
+
+        self.assertEqual(score, 75.0)
 
 
 if __name__ == "__main__":

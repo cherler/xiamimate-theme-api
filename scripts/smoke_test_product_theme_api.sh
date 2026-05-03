@@ -174,10 +174,24 @@ cat > "$TMP_DIR/forecast.json" <<EOF
 }
 EOF
 
+cat > "$TMP_DIR/opportunity.json" <<EOF
+{
+  "query": "$PRODUCT_QUERY",
+  "marketplace": "$MARKETPLACE",
+  "platform": "Amazon",
+  "limit": 3,
+  "window_days": $WINDOW_DAYS,
+  "min_data_confidence": "low",
+  "include_expandable": true
+}
+EOF
+
 curl_json POST "$API_BASE_URL/api/product-theme/candidate-pool-stats" "$TMP_DIR/stats.json" "$TMP_DIR/stats.out.json"
 curl_json POST "$API_BASE_URL/api/product-theme/candidate-pool-trends" "$TMP_DIR/stats.json" "$TMP_DIR/trends.out.json"
 curl_json POST "$API_BASE_URL/api/product-theme/candidate-pool-weak-forecast" "$TMP_DIR/forecast.json" "$TMP_DIR/forecast.out.json"
 curl_json POST "$API_BASE_URL/api/product-theme/category-benchmark" "$TMP_DIR/stats.json" "$TMP_DIR/benchmark.out.json"
+curl_json POST "$API_BASE_URL/api/product-theme/opportunity-discovery" "$TMP_DIR/opportunity.json" "$TMP_DIR/opportunity.out.json"
+curl_json POST "$API_BASE_URL/api/product-theme/product-forecast-explain" "$TMP_DIR/forecast.json" "$TMP_DIR/product_forecast_explain.out.json"
 
 TOP_ASINS="$($PROJECT_PYTHON - "$TMP_DIR/forecast.out.json" "$TOP_N" "$CANDIDATE_ASINS" <<'PY'
 import json
@@ -214,6 +228,8 @@ validate_response "candidate-pool-stats" "$TMP_DIR/stats.out.json" "/api/product
 validate_response "candidate-pool-trends" "$TMP_DIR/trends.out.json" "/api/product-theme/candidate-pool-trends"
 validate_response "candidate-pool-weak-forecast" "$TMP_DIR/forecast.out.json" "/api/product-theme/candidate-pool-weak-forecast"
 validate_response "category-benchmark" "$TMP_DIR/benchmark.out.json" "/api/product-theme/category-benchmark"
+validate_response "opportunity-discovery" "$TMP_DIR/opportunity.out.json" "/api/product-theme/opportunity-discovery"
+validate_response "product-forecast-explain" "$TMP_DIR/product_forecast_explain.out.json" "/api/product-theme/product-forecast-explain"
 validate_response "top-asin-drilldown" "$TMP_DIR/drilldown.out.json" "/api/product-theme/top-asin-drilldown"
 
 pretty_print "health" "$TMP_DIR/health.out.json"
@@ -222,4 +238,6 @@ pretty_print "candidate-pool-stats" "$TMP_DIR/stats.out.json"
 pretty_print "candidate-pool-trends" "$TMP_DIR/trends.out.json"
 pretty_print "candidate-pool-weak-forecast" "$TMP_DIR/forecast.out.json"
 pretty_print "category-benchmark" "$TMP_DIR/benchmark.out.json"
+pretty_print "opportunity-discovery" "$TMP_DIR/opportunity.out.json"
+pretty_print "product-forecast-explain" "$TMP_DIR/product_forecast_explain.out.json"
 pretty_print "top-asin-drilldown" "$TMP_DIR/drilldown.out.json"

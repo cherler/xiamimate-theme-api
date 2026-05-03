@@ -87,6 +87,7 @@ MIN_TOKEN_LENGTH = 2
 DEFAULT_MIN_CANDIDATE_POOL_SIZE = 8
 DEFAULT_TARGET_CANDIDATE_POOL_SIZE = 20
 DEFAULT_DOMINANT_CATEGORY_SHARE_THRESHOLD = 0.7
+CANDIDATE_EXPANSION_ACTIVE_STATUSES = ("queued", "waiting_token", "discovering", "hydrating", "syncing")
 
 QUERY_MODIFIER_TOKENS = {
     "adjustable",
@@ -311,12 +312,51 @@ class CandidateExpansionJobStatusRequest(BaseModel):
         return value or None
 
 
+class OpportunityDiscoveryRequest(BaseModel):
+    marketplace: str | int = "US"
+    platform: str = "Amazon"
+    query: str | None = None
+    category_id: int | None = None
+    category_path: str | None = None
+    limit: int = Field(default=10, ge=1, le=30)
+    window_days: int = Field(default=30, ge=7, le=180)
+    min_data_confidence: str = "low"
+    include_expandable: bool = True
+    include_descendants: bool = True
+
+    @validator("query", "category_path", pre=True, always=True)
+    def _normalize_optional_string(cls, v: Any) -> str | None:  # noqa: N805
+        if v is None:
+            return None
+        value = str(v).strip()
+        return value or None
+
+    @validator("platform")
+    def _validate_platform(cls, v: str) -> str:  # noqa: N805
+        value = (v or "Amazon").strip()
+        if value.lower() != "amazon":
+            raise ValueError("opportunity discovery MVP currently supports Amazon only")
+        return "Amazon"
+
+    @validator("min_data_confidence")
+    def _validate_min_data_confidence(cls, v: str) -> str:  # noqa: N805
+        value = (v or "low").strip().lower()
+        allowed = {"low", "medium", "high"}
+        if value not in allowed:
+            raise ValueError("min_data_confidence must be one of: low, medium, high")
+        return value
+
+
 class WeakForecastRequest(CandidatePoolRequest):
     top_n: int = Field(default=5, ge=1, le=20)
 
 
 class DrilldownRequest(CandidatePoolRequest):
     top_n: int | None = Field(default=None, ge=1, le=20)
+
+
+class ProductForecastExplainRequest(DrilldownRequest):
+    top_n: int | None = Field(default=10, ge=1, le=20)
 
 
 class AsinHistoryTimeseriesRequest(BaseModel):
@@ -462,6 +502,45 @@ def _normalize_marketplace(value: str | int) -> tuple[int, str]:
 
 def _normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower())
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _bounded_score(value: float) -> float:
+    return round(max(0.0, min(100.0, float(value))), 2)
+
+
+def _price_fit_score(price: Any) -> float:
+    value = _safe_float(price, 0.0)
+    if value <= 0:
+        return 50.0
+    if 18 <= value <= 80:
+        return 100.0
+    if 10 <= value < 18 or 80 < value <= 140:
+        return 75.0
+    if 6 <= value < 10 or 140 < value <= 220:
+        return 55.0
+    return 35.0
+
+
+def _confidence_rank(value: str) -> int:
+    return {"low": 1, "medium": 2, "high": 3}.get(str(value or "low").lower(), 1)
 
 
 def _get_query_normalizer_config() -> dict[str, Any]:
@@ -1487,6 +1566,33 @@ class ProductThemeService:
         hydrate_tokens = min(request.target_asin_count, 100) * 2
         return discovery_tokens + hydrate_tokens
 
+    def _validate_candidate_expansion_request(self, request: CandidateExpansionJobRequest) -> None:
+        has_category_id = request.category_id is not None
+        has_product_query = bool(request.product_query)
+        has_category_path = bool(request.category_path)
+
+        if not has_product_query and not has_category_id:
+            detail = "product_query or category_id is required"
+            if has_category_path:
+                detail = "category_path is not executable by itself; call category_resolve first and pass category_id"
+            raise HTTPException(status_code=400, detail=detail)
+
+        if request.recall_mode == "category" and not has_category_id:
+            raise HTTPException(
+                status_code=400,
+                detail="category recall requires category_id; call category_resolve first and pass the selected category_id",
+            )
+
+        if has_category_path and not has_category_id and request.recall_mode in {"category", "hybrid"}:
+            raise HTTPException(
+                status_code=400,
+                detail="category_path cannot be used as an execution key; call category_resolve first and pass category_id",
+            )
+
+    def _candidate_expansion_category_lock_key(self, *, domain: int, category_id: int, include_descendants: bool) -> str:
+        include_flag = 1 if include_descendants else 0
+        return f"candidate-expansion:domain:{domain}:category:{category_id}:desc:{include_flag}"
+
     def _format_candidate_expansion_job(self, row: dict[str, Any]) -> dict[str, Any]:
         return {
             "job_id": row.get("job_id"),
@@ -1519,93 +1625,266 @@ class ProductThemeService:
             "meta_json": row.get("meta_json") or {},
         }
 
+    def _build_candidate_expansion_data_readiness(
+        self,
+        job: dict[str, Any],
+        coverage_row: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        coverage_row = coverage_row or {}
+        requested_asins = _sanitize_asins(job.get("result_candidate_asins") or [])
+        requested_count = len(requested_asins)
+        min_pool_size = int(job.get("min_pool_size") or DEFAULT_MIN_CANDIDATE_POOL_SIZE)
+        ready_threshold = max(1, min(requested_count, min_pool_size)) if requested_count else 0
+
+        registry_hit_count = int(coverage_row.get("registry_hit_count") or 0)
+        snapshot_hit_count = int(coverage_row.get("snapshot_hit_count") or 0)
+        history_hit_count = int(coverage_row.get("history_hit_count") or 0)
+        history_row_count = int(coverage_row.get("history_row_count") or 0)
+        serving_base_hit_count = int(coverage_row.get("serving_base_hit_count") or 0)
+        serving_base_row_count = int(coverage_row.get("serving_base_row_count") or 0)
+
+        def coverage_ratio(hit_count: int) -> float:
+            return round(hit_count / requested_count, 4) if requested_count else 0.0
+
+        registry_ready = requested_count == 0 or registry_hit_count >= requested_count
+        hydration_hit_count = max(snapshot_hit_count, history_hit_count)
+        hydration_ready = requested_count > 0 and hydration_hit_count >= ready_threshold
+        serving_ready = requested_count > 0 and serving_base_hit_count >= ready_threshold
+
+        if requested_count == 0:
+            readiness_status = "no_candidates"
+        elif serving_ready:
+            readiness_status = "analysis_ready"
+        elif hydration_ready:
+            readiness_status = "serving_sync_pending"
+        elif registry_ready:
+            readiness_status = "history_hydration_pending"
+        else:
+            readiness_status = "registry_sync_pending"
+
+        return {
+            "requested_asin_count": requested_count,
+            "ready_threshold": ready_threshold,
+            "registry_hit_count": registry_hit_count,
+            "registry_coverage_ratio": coverage_ratio(registry_hit_count),
+            "snapshot_hit_count": snapshot_hit_count,
+            "snapshot_coverage_ratio": coverage_ratio(snapshot_hit_count),
+            "history_hit_count": history_hit_count,
+            "history_coverage_ratio": coverage_ratio(history_hit_count),
+            "history_row_count": history_row_count,
+            "history_latest_date": _iso_date_or_none(coverage_row.get("history_latest_date")),
+            "serving_base_hit_count": serving_base_hit_count,
+            "serving_base_coverage_ratio": coverage_ratio(serving_base_hit_count),
+            "serving_base_row_count": serving_base_row_count,
+            "serving_base_latest_date": _iso_date_or_none(coverage_row.get("serving_base_latest_date")),
+            "registry_ready": registry_ready,
+            "hydration_ready": hydration_ready,
+            "serving_ready": serving_ready,
+            "analysis_ready": serving_ready,
+            "readiness_status": readiness_status,
+        }
+
+    def _fetch_candidate_expansion_data_readiness(self, conn, job: dict[str, Any]) -> dict[str, Any]:
+        requested_asins = _sanitize_asins(job.get("result_candidate_asins") or [])
+        if not requested_asins:
+            return self._build_candidate_expansion_data_readiness(job)
+
+        domain = int(job.get("domain") or 1)
+        rows = _run_pg_dict_query(
+            conn,
+            """
+            WITH requested AS (
+                SELECT UNNEST(%s::TEXT[]) AS asin
+            ),
+            registry AS (
+                SELECT DISTINCT r.asin
+                FROM sync.keepa_asin_registry r
+                JOIN requested q ON q.asin = r.asin
+                WHERE r.domain = %s
+            ),
+            snapshot AS (
+                SELECT DISTINCT s.asin
+                FROM sync.keepa_product_snapshot s
+                JOIN requested q ON q.asin = s.asin
+                WHERE s.domain = %s
+            ),
+            history AS (
+                SELECT h.asin, COUNT(*) AS row_count, MAX(h.date) AS latest_date
+                FROM sync.keepa_product_history h
+                JOIN requested q ON q.asin = h.asin
+                WHERE h.domain = %s
+                GROUP BY h.asin
+            ),
+            serving_base AS (
+                SELECT b.asin, COUNT(*) AS row_count, MAX(b.date) AS latest_date
+                FROM serving.theme_base_daily b
+                JOIN requested q ON q.asin = b.asin
+                WHERE b.domain = %s
+                GROUP BY b.asin
+            )
+            SELECT
+                COUNT(DISTINCT registry.asin) AS registry_hit_count,
+                COUNT(DISTINCT snapshot.asin) AS snapshot_hit_count,
+                COUNT(DISTINCT history.asin) AS history_hit_count,
+                COALESCE(SUM(history.row_count), 0) AS history_row_count,
+                MAX(history.latest_date) AS history_latest_date,
+                COUNT(DISTINCT serving_base.asin) AS serving_base_hit_count,
+                COALESCE(SUM(serving_base.row_count), 0) AS serving_base_row_count,
+                MAX(serving_base.latest_date) AS serving_base_latest_date
+            FROM requested q
+            LEFT JOIN registry ON registry.asin = q.asin
+            LEFT JOIN snapshot ON snapshot.asin = q.asin
+            LEFT JOIN history ON history.asin = q.asin
+            LEFT JOIN serving_base ON serving_base.asin = q.asin
+            """,
+            [requested_asins, domain, domain, domain, domain],
+        )
+        return self._build_candidate_expansion_data_readiness(job, rows[0] if rows else {})
+
     def create_candidate_expansion_job(self, request: CandidateExpansionJobRequest) -> dict[str, Any]:
         domain, marketplace = _normalize_marketplace(request.marketplace)
-        if not request.product_query and request.category_id is None and not request.category_path:
-            raise HTTPException(status_code=400, detail="product_query or category_id/category_path is required")
+        self._validate_candidate_expansion_request(request)
 
         tokens_estimated = self._estimate_candidate_expansion_tokens(request)
         status_reason = "queued for collector; no Keepa token is consumed by theme-api"
+        category_lock_key = (
+            self._candidate_expansion_category_lock_key(
+                domain=domain,
+                category_id=int(request.category_id),
+                include_descendants=request.include_descendants,
+            )
+            if request.category_id is not None
+            else None
+        )
         meta_json = {
             "notes": request.notes,
             "created_by": "theme-api",
             "token_budget_policy": "collector-owned",
+            "category_execution_key": category_lock_key,
         }
 
         with _postgres_conn() as conn:
-            if request.idempotency_key:
-                existing = _run_pg_dict_query(
+            category_lock_acquired = False
+            try:
+                if category_lock_key:
+                    _run_pg_dict_query(conn, "SELECT pg_advisory_lock(hashtext(%s))", [category_lock_key])
+                    category_lock_acquired = True
+
+                if request.idempotency_key:
+                    existing = _run_pg_dict_query(
+                        conn,
+                        """
+                        SELECT *
+                        FROM sync.keepa_candidate_expansion_jobs
+                        WHERE idempotency_key = %s
+                        LIMIT 1
+                        """,
+                        [request.idempotency_key],
+                    )
+                    if existing:
+                        return {
+                            "job": self._format_candidate_expansion_job(existing[0]),
+                            "created": False,
+                            "notes": ["existing job returned by idempotency_key"],
+                        }
+
+                if request.category_id is not None:
+                    existing_category_job = _run_pg_dict_query(
+                        conn,
+                        """
+                        SELECT *
+                        FROM sync.keepa_candidate_expansion_jobs
+                        WHERE domain = %s
+                          AND category_id = %s
+                          AND include_descendants IS NOT DISTINCT FROM %s
+                          AND status = ANY(%s::TEXT[])
+                        ORDER BY created_at ASC
+                        LIMIT 1
+                        """,
+                        [
+                            domain,
+                            request.category_id,
+                            request.include_descendants,
+                            list(CANDIDATE_EXPANSION_ACTIVE_STATUSES),
+                        ],
+                    )
+                    if existing_category_job:
+                        return {
+                            "job": self._format_candidate_expansion_job(existing_category_job[0]),
+                            "created": False,
+                            "notes": [
+                                "existing active category expansion job returned",
+                                "registry, hydration, and serving sync should be read from this job's data_readiness",
+                            ],
+                        }
+
+                job_id = f"kexp_{uuid.uuid4().hex}"
+                rows = _run_pg_dict_query(
                     conn,
                     """
-                    SELECT *
-                    FROM sync.keepa_candidate_expansion_jobs
-                    WHERE idempotency_key = %s
-                    LIMIT 1
+                    INSERT INTO sync.keepa_candidate_expansion_jobs (
+                        job_id,
+                        domain,
+                        marketplace,
+                        source,
+                        priority,
+                        product_query,
+                        recall_mode,
+                        category_id,
+                        category_path,
+                        include_descendants,
+                        target_asin_count,
+                        min_pool_size,
+                        status,
+                        status_reason,
+                        requested_by_session_id,
+                        requested_by_user_id,
+                        idempotency_key,
+                        tokens_estimated,
+                        meta_json,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        'queued', %s, %s, %s, %s, %s, %s::JSONB, NOW(), NOW()
+                    )
+                    ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL AND idempotency_key <> ''
+                    DO UPDATE SET updated_at = sync.keepa_candidate_expansion_jobs.updated_at
+                    RETURNING *, (xmax = 0) AS inserted
                     """,
-                    [request.idempotency_key],
+                    [
+                        job_id,
+                        domain,
+                        marketplace,
+                        request.source,
+                        request.priority,
+                        request.product_query,
+                        request.recall_mode,
+                        request.category_id,
+                        request.category_path,
+                        request.include_descendants,
+                        request.target_asin_count,
+                        request.min_pool_size,
+                        status_reason,
+                        request.requested_by_session_id,
+                        request.requested_by_user_id,
+                        request.idempotency_key,
+                        tokens_estimated,
+                        psycopg2.extras.Json(meta_json),
+                    ],
                 )
-                if existing:
-                    return {
-                        "job": self._format_candidate_expansion_job(existing[0]),
-                        "created": False,
-                        "notes": ["existing job returned by idempotency_key"],
-                    }
+            finally:
+                if category_lock_acquired and category_lock_key:
+                    _run_pg_dict_query(conn, "SELECT pg_advisory_unlock(hashtext(%s))", [category_lock_key])
 
-            job_id = f"kexp_{uuid.uuid4().hex}"
-            rows = _run_pg_dict_query(
-                conn,
-                """
-                INSERT INTO sync.keepa_candidate_expansion_jobs (
-                    job_id,
-                    domain,
-                    marketplace,
-                    source,
-                    priority,
-                    product_query,
-                    recall_mode,
-                    category_id,
-                    category_path,
-                    include_descendants,
-                    target_asin_count,
-                    min_pool_size,
-                    status,
-                    status_reason,
-                    requested_by_session_id,
-                    requested_by_user_id,
-                    idempotency_key,
-                    tokens_estimated,
-                    meta_json,
-                    created_at,
-                    updated_at
-                )
-                VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    'queued', %s, %s, %s, %s, %s, %s::JSONB, NOW(), NOW()
-                )
-                RETURNING *
-                """,
-                [
-                    job_id,
-                    domain,
-                    marketplace,
-                    request.source,
-                    request.priority,
-                    request.product_query,
-                    request.recall_mode,
-                    request.category_id,
-                    request.category_path,
-                    request.include_descendants,
-                    request.target_asin_count,
-                    request.min_pool_size,
-                    status_reason,
-                    request.requested_by_session_id,
-                    request.requested_by_user_id,
-                    request.idempotency_key,
-                    tokens_estimated,
-                    psycopg2.extras.Json(meta_json),
-                ],
-            )
-
+        created = bool(rows[0].pop("inserted", True))
+        if not created:
+            return {
+                "job": self._format_candidate_expansion_job(rows[0]),
+                "created": False,
+                "notes": ["existing job returned by idempotency_key"],
+            }
         return {
             "job": self._format_candidate_expansion_job(rows[0]),
             "created": True,
@@ -1613,6 +1892,473 @@ class ProductThemeService:
                 "candidate expansion is queued; collector owns Keepa token reservation and execution",
                 "status will move through queued/waiting_token/discovering/hydrating/syncing/completed",
             ],
+        }
+
+    def _opportunity_data_confidence(self, *, candidate_count: int, trend_coverage: float, row_count: int) -> str:
+        if candidate_count >= 12 and row_count >= 120 and trend_coverage >= 0.35:
+            return "high"
+        if candidate_count >= 5 and row_count >= 30:
+            return "medium"
+        return "low"
+
+    def _build_opportunity_score(self, breakdown: dict[str, float]) -> float:
+        return round(
+            0.20 * breakdown.get("demand_score", 0.0)
+            + 0.20 * breakdown.get("trend_score", 0.0)
+            + 0.15 * breakdown.get("competition_headroom_score", 0.0)
+            + 0.15 * breakdown.get("price_fit_score", 0.0)
+            + 0.15 * breakdown.get("forecast_growth_score", 0.0)
+            + 0.10 * breakdown.get("coverage_gap_score", 0.0)
+            + 0.05 * breakdown.get("evidence_quality_score", 0.0),
+            2,
+        )
+
+    def _make_opportunity_id(self, *parts: Any) -> str:
+        key = ":".join(str(part or "") for part in parts)
+        return f"opp_{uuid.uuid5(uuid.NAMESPACE_URL, key).hex[:16]}"
+
+    def _filter_opportunities_by_confidence(
+        self,
+        cards: list[dict[str, Any]],
+        *,
+        min_data_confidence: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        min_rank = _confidence_rank(min_data_confidence)
+        filtered = [card for card in cards if _confidence_rank(str(card.get("data_confidence") or "low")) >= min_rank]
+        return filtered[:limit]
+
+    def _fetch_category_opportunity_rows(
+        self,
+        *,
+        domain: int,
+        category_id: int | None,
+        category_path: str | None,
+        include_descendants: bool,
+        window_days: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        effective_window_days = max(14, _effective_feature_window_days(window_days))
+        with _postgres_conn() as conn:
+            return _run_pg_dict_query(
+                conn,
+                """
+                WITH RECURSIVE category_seed AS MATERIALIZED (
+                    SELECT %s::BIGINT AS category_id
+                ),
+                category_subtree(category_id) AS MATERIALIZED (
+                    SELECT category_id
+                    FROM category_seed
+                    WHERE category_id IS NOT NULL
+
+                    UNION
+
+                    SELECT child.category_id
+                    FROM sync.keepa_category_registry child
+                    JOIN category_subtree parent
+                      ON child.parent_id = parent.category_id
+                    WHERE child.domain = %s
+                      AND %s IS TRUE
+                      AND child.category_id <> parent.category_id
+                ),
+                max_date AS (
+                    SELECT MAX(date) AS max_date
+                    FROM serving.theme_cross_daily
+                    WHERE domain = %s
+                ),
+                scoped_registry AS MATERIALIZED (
+                    SELECT
+                        r.asin,
+                        r.domain,
+                        r.category_id,
+                        NULLIF(r.category_path, '') AS category_path,
+                        NULLIF(r.category, '') AS category_name,
+                        COALESCE(r.is_active, TRUE) AS is_active
+                    FROM sync.keepa_asin_registry r
+                    WHERE r.domain = %s
+                      AND COALESCE(r.is_active, TRUE) = TRUE
+                      AND (
+                          %s::BIGINT IS NULL
+                          OR r.category_id IN (SELECT category_id FROM category_subtree)
+                      )
+                      AND (
+                          %s::TEXT IS NULL
+                          OR %s::TEXT = ''
+                          OR LOWER(COALESCE(r.category_path, '')) = LOWER(%s::TEXT)
+                          OR (%s IS TRUE AND LOWER(COALESCE(r.category_path, '')) LIKE (LOWER(%s::TEXT) || ' > %%'))
+                      )
+                ),
+                filtered AS MATERIALIZED (
+                    SELECT
+                        d.asin,
+                        d.domain,
+                        d.date,
+                        d.product_title,
+                        d.effective_price,
+                        d.bsr,
+                        d.rating,
+                        d.review_count,
+                        COALESCE(d.new_offer_count, 0) + COALESCE(d.used_offer_count, 0) AS offer_count,
+                        d.estimated_daily_sales,
+                        d.trend_index_mean,
+                        r.category_id,
+                        r.category_path,
+                        r.category_name
+                    FROM serving.theme_cross_daily d
+                    JOIN scoped_registry r
+                      ON d.asin = r.asin AND d.domain = r.domain
+                    WHERE d.domain = %s
+                      AND d.date >= (
+                          SELECT max_date - (%s * INTERVAL '1 day')
+                          FROM max_date
+                      )
+                )
+                SELECT
+                    f.category_id,
+                    COALESCE(f.category_path, f.category_name, 'UNKNOWN') AS category_path,
+                    COALESCE(f.category_name, SPLIT_PART(COALESCE(f.category_path, 'UNKNOWN'), ' > ', ARRAY_LENGTH(STRING_TO_ARRAY(COALESCE(f.category_path, 'UNKNOWN'), ' > '), 1))) AS category_name,
+                    COUNT(*) AS row_count,
+                    COUNT(DISTINCT f.asin) AS candidate_count,
+                    SUM(COALESCE(f.estimated_daily_sales, 0)) AS sales_window_sum,
+                    AVG(f.estimated_daily_sales) AS sales_daily_avg,
+                    AVG(f.estimated_daily_sales) FILTER (WHERE f.date >= (SELECT max_date - INTERVAL '6 day' FROM max_date)) AS sales_mean_7,
+                    AVG(f.estimated_daily_sales) FILTER (WHERE f.date < (SELECT max_date - INTERVAL '6 day' FROM max_date)) AS sales_mean_prev,
+                    AVG(f.trend_index_mean) FILTER (WHERE f.date >= (SELECT max_date - INTERVAL '6 day' FROM max_date)) AS trend_mean_7,
+                    AVG(f.trend_index_mean) FILTER (WHERE f.date < (SELECT max_date - INTERVAL '6 day' FROM max_date)) AS trend_mean_prev,
+                    COUNT(*) FILTER (WHERE f.trend_index_mean IS NOT NULL) AS trend_rows,
+                    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY f.effective_price) AS price_p50,
+                    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY f.review_count) AS review_count_median,
+                    AVG(f.offer_count) AS offer_count_avg,
+                    MIN(f.date) AS min_date,
+                    MAX(f.date) AS max_date
+                FROM filtered f
+                GROUP BY 1, 2, 3
+                HAVING COUNT(DISTINCT f.asin) >= 3
+                ORDER BY sales_window_sum DESC NULLS LAST, candidate_count DESC
+                LIMIT %s
+                """,
+                [
+                    category_id,
+                    domain,
+                    include_descendants,
+                    domain,
+                    domain,
+                    category_id,
+                    category_path,
+                    category_path,
+                    category_path,
+                    include_descendants,
+                    category_path,
+                    domain,
+                    effective_window_days - 1,
+                    limit,
+                ],
+            )
+
+    def _build_category_opportunity_card(
+        self,
+        *,
+        row: dict[str, Any],
+        marketplace: str,
+        window_days: int,
+        max_sales_window_sum: float,
+        include_expandable: bool,
+    ) -> dict[str, Any]:
+        candidate_count = _safe_int(row.get("candidate_count"))
+        row_count = _safe_int(row.get("row_count"))
+        trend_rows = _safe_int(row.get("trend_rows"))
+        trend_coverage = round(trend_rows / row_count, 4) if row_count else 0.0
+        sales_window_sum = _safe_float(row.get("sales_window_sum"))
+        sales_mean_7 = _safe_float(row.get("sales_mean_7"))
+        sales_mean_prev = _safe_float(row.get("sales_mean_prev"))
+        trend_mean_7 = _safe_float(row.get("trend_mean_7"))
+        trend_mean_prev = _safe_float(row.get("trend_mean_prev"))
+        sales_momentum_pct = ((sales_mean_7 - sales_mean_prev) / sales_mean_prev * 100.0) if sales_mean_prev > 0 else 0.0
+        trend_momentum_pct = ((trend_mean_7 - trend_mean_prev) / trend_mean_prev * 100.0) if trend_mean_prev > 0 else 0.0
+        offer_count_avg = _safe_float(row.get("offer_count_avg"))
+        review_count_median = _safe_float(row.get("review_count_median"))
+        price_p50 = row.get("price_p50")
+        demand_score = _bounded_score((sales_window_sum / max(max_sales_window_sum, 1.0)) * 100.0)
+        trend_score = _bounded_score(50.0 + trend_momentum_pct * 2.0 + sales_momentum_pct * 0.6)
+        competition_headroom_score = _bounded_score(100.0 - min(60.0, offer_count_avg * 2.5) - min(25.0, review_count_median / 800.0))
+        coverage_gap_score = _bounded_score(85.0 - min(55.0, candidate_count * 2.0)) if include_expandable else 40.0
+        evidence_quality_score = _bounded_score(min(candidate_count * 6.0, 60.0) + trend_coverage * 40.0)
+        score_breakdown = {
+            "demand_score": demand_score,
+            "trend_score": trend_score,
+            "competition_headroom_score": competition_headroom_score,
+            "price_fit_score": _price_fit_score(price_p50),
+            "forecast_growth_score": trend_score,
+            "coverage_gap_score": coverage_gap_score,
+            "evidence_quality_score": evidence_quality_score,
+        }
+        data_confidence = self._opportunity_data_confidence(
+            candidate_count=candidate_count,
+            trend_coverage=trend_coverage,
+            row_count=row_count,
+        )
+        category_path = str(row.get("category_path") or "UNKNOWN")
+        category_name = str(row.get("category_name") or _leaf_category_name(category_path) or category_path)
+        return {
+            "opportunity_id": self._make_opportunity_id(marketplace, "category", row.get("category_id"), category_path),
+            "title": category_name,
+            "marketplace": marketplace,
+            "platform": "Amazon",
+            "source": "local_category_opportunity_scan",
+            "category_id": _safe_int(row.get("category_id")) if row.get("category_id") is not None else None,
+            "category_path": category_path,
+            "candidate_pool_id": None,
+            "opportunity_score": self._build_opportunity_score(score_breakdown),
+            "score_breakdown": score_breakdown,
+            "evidence_summary": {
+                "window_days": window_days,
+                "candidate_count": candidate_count,
+                "sales_window_sum": round(sales_window_sum, 2),
+                "sales_momentum_pct": round(sales_momentum_pct, 2),
+                "trend_momentum_pct": round(trend_momentum_pct, 2),
+                "trend_coverage": trend_coverage,
+                "price_p50": round(_safe_float(price_p50), 2) if price_p50 is not None else None,
+                "offer_count_avg": round(offer_count_avg, 2),
+                "review_count_median": round(review_count_median, 2),
+                "data_max_date": _iso_date_or_none(row.get("max_date")),
+            },
+            "data_confidence": data_confidence,
+            "next_action": {
+                "type": "analyze_theme",
+                "label": "进入商品主题分析",
+                "request": {
+                    "product_query": category_name,
+                    "marketplace": marketplace,
+                    "category_id": _safe_int(row.get("category_id")) if row.get("category_id") is not None else None,
+                    "category_path": category_path,
+                    "recall_mode": "category",
+                    "include_descendants": True,
+                },
+            },
+        }
+
+    def _build_query_opportunity_card(
+        self,
+        *,
+        request: OpportunityDiscoveryRequest,
+        marketplace: str,
+        resolved: dict[str, Any],
+        stats: dict[str, Any],
+        trends: dict[str, Any],
+        forecast: dict[str, Any],
+        benchmark: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        candidate_count = _safe_int(stats.get("candidate_count"))
+        trend_coverage = _safe_float((trends.get("trend_data_coverage") if trends else None), 0.0)
+        trend_wow = _safe_float(trends.get("trend_wow") if trends else None)
+        bullish_count = _safe_int(forecast.get("bullish_asin_count"))
+        risk_count = _safe_int(forecast.get("risk_asin_count"))
+        forecast_total = bullish_count + risk_count
+        bullish_ratio = bullish_count / forecast_total if forecast_total else 0.5
+        sales_window_sum = _safe_float(stats.get("sales_window_sum"))
+        sales_window_avg = _safe_float(stats.get("sales_window_avg"))
+        offer_count_median = _safe_float(stats.get("offer_count_median"))
+        review_count_median = _safe_float(stats.get("review_count_median"))
+        score_breakdown = {
+            "demand_score": _bounded_score(min(100.0, sales_window_avg * 1.8 + sales_window_sum / 400.0)),
+            "trend_score": _bounded_score(50.0 + trend_wow * 4.0),
+            "competition_headroom_score": _bounded_score(100.0 - min(60.0, offer_count_median * 2.5) - min(25.0, review_count_median / 800.0)),
+            "price_fit_score": _price_fit_score((stats.get("price_distribution") or {}).get("p50")),
+            "forecast_growth_score": _bounded_score(bullish_ratio * 100.0),
+            "coverage_gap_score": _bounded_score(100.0 - min(100.0, candidate_count * 4.0)) if request.include_expandable else 40.0,
+            "evidence_quality_score": _bounded_score(min(candidate_count * 6.0, 60.0) + trend_coverage * 40.0),
+        }
+        data_confidence = self._opportunity_data_confidence(
+            candidate_count=candidate_count,
+            trend_coverage=trend_coverage,
+            row_count=max(candidate_count * request.window_days, 0),
+        )
+        category_constraint = resolved.get("category_constraint") or {}
+        title = request.query or request.category_path or _leaf_category_name(category_constraint.get("category_path")) or "Amazon opportunity"
+        return {
+            "opportunity_id": self._make_opportunity_id(marketplace, "query", title, resolved.get("candidate_pool_id")),
+            "title": title,
+            "marketplace": marketplace,
+            "platform": "Amazon",
+            "source": "resolved_candidate_pool",
+            "category_id": category_constraint.get("category_id") or request.category_id,
+            "category_path": category_constraint.get("category_path") or request.category_path,
+            "candidate_pool_id": resolved.get("candidate_pool_id"),
+            "opportunity_score": self._build_opportunity_score(score_breakdown),
+            "score_breakdown": score_breakdown,
+            "evidence_summary": {
+                "window_days": request.window_days,
+                "candidate_count": candidate_count,
+                "candidate_asins": resolved.get("candidate_asins", [])[:20],
+                "pool_quality": resolved.get("pool_quality") or {},
+                "sales_window_sum": round(sales_window_sum, 2),
+                "sales_window_avg": round(sales_window_avg, 2),
+                "price_distribution": stats.get("price_distribution") or {},
+                "offer_count_median": round(offer_count_median, 2),
+                "review_count_median": round(review_count_median, 2),
+                "trend_stage": trends.get("trend_stage") if trends else None,
+                "trend_wow": trends.get("trend_wow") if trends else None,
+                "trend_coverage": trend_coverage,
+                "forecast_type": forecast.get("forecast_type"),
+                "bullish_asin_count": bullish_count,
+                "risk_asin_count": risk_count,
+                "predicted_top_asins": forecast.get("predicted_top_asins", [])[:5],
+                "benchmark_anchor": (benchmark or {}).get("benchmark_anchor"),
+                "benchmark_is_precise": (benchmark or {}).get("benchmark_is_precise"),
+                "data_max_date": _iso_date_or_none(stats.get("data_max_date")),
+            },
+            "data_confidence": data_confidence,
+            "next_action": {
+                "type": "quick_report",
+                "label": "生成快速选品报告",
+                "request": {
+                    "product_query": title,
+                    "marketplace": marketplace,
+                    "candidate_pool_id": resolved.get("candidate_pool_id"),
+                    "candidate_asins": resolved.get("candidate_asins", [])[:50],
+                    "category_id": category_constraint.get("category_id") or request.category_id,
+                    "category_path": category_constraint.get("category_path") or request.category_path,
+                },
+            },
+        }
+
+    async def discover_opportunities(self, request: OpportunityDiscoveryRequest) -> dict[str, Any]:
+        domain, marketplace = _normalize_marketplace(request.marketplace)
+        notes = [
+            "opportunity discovery MVP is local and read-only; theme-api does not consume Keepa tokens here",
+            "scores are directional and should route promising cards into product theme analysis before final selection",
+        ]
+
+        if request.query:
+            resolve_request = ResolveCandidatesRequest(
+                product_query=request.query,
+                marketplace=marketplace,
+                recall_mode="hybrid" if request.category_id is not None or request.category_path else "keyword",
+                category_id=request.category_id,
+                category_path=request.category_path,
+                include_descendants=request.include_descendants,
+                min_pool_size=DEFAULT_MIN_CANDIDATE_POOL_SIZE,
+                target_pool_size=max(DEFAULT_TARGET_CANDIDATE_POOL_SIZE, request.limit * 4),
+                expand_if_small=request.include_expandable,
+                max_candidates=max(50, request.limit * 10),
+            )
+            resolved = await self.resolve_candidates(resolve_request)
+            candidate_asins = _sanitize_asins(resolved.get("candidate_asins", []))
+            if not candidate_asins:
+                return {
+                    "marketplace": marketplace,
+                    "domain": domain,
+                    "platform": request.platform,
+                    "query": request.query,
+                    "category_id": request.category_id,
+                    "category_path": request.category_path,
+                    "opportunity_count": 0,
+                    "opportunities": [],
+                    "notes": notes + ["no local candidate pool was resolved; queue candidate expansion before analysis"],
+                }
+
+            pool_request = CandidatePoolRequest(
+                candidate_asins=candidate_asins,
+                candidate_pool_id=resolved.get("candidate_pool_id"),
+                marketplace=marketplace,
+                window_days=request.window_days,
+            )
+            stats = self.get_candidate_pool_stats(pool_request)
+            trends = self.get_candidate_pool_trends(pool_request)
+            forecast = self.get_candidate_pool_weak_forecast(
+                WeakForecastRequest(
+                    candidate_asins=candidate_asins,
+                    candidate_pool_id=resolved.get("candidate_pool_id"),
+                    marketplace=marketplace,
+                    window_days=request.window_days,
+                    top_n=min(FORECAST_TOP_ASINS_LIMIT, request.limit),
+                )
+            )
+            benchmark: dict[str, Any] | None = None
+            with contextlib.suppress(Exception):
+                benchmark = self.get_category_benchmark(
+                    CategoryBenchmarkRequest(
+                        candidate_asins=candidate_asins,
+                        candidate_pool_id=resolved.get("candidate_pool_id"),
+                        marketplace=marketplace,
+                        window_days=request.window_days,
+                        benchmark_category_id=request.category_id,
+                        benchmark_category_path=request.category_path,
+                        include_descendants=request.include_descendants,
+                    )
+                )
+            card = self._build_query_opportunity_card(
+                request=request,
+                marketplace=marketplace,
+                resolved=resolved,
+                stats=stats,
+                trends=trends,
+                forecast=forecast,
+                benchmark=benchmark,
+            )
+            opportunities = self._filter_opportunities_by_confidence(
+                [card],
+                min_data_confidence=request.min_data_confidence,
+                limit=request.limit,
+            )
+            return {
+                "marketplace": marketplace,
+                "domain": domain,
+                "platform": request.platform,
+                "query": request.query,
+                "category_id": request.category_id,
+                "category_path": request.category_path,
+                "opportunity_count": len(opportunities),
+                "opportunities": opportunities,
+                "diagnostics": {
+                    "resolved_candidate_count": len(candidate_asins),
+                    "candidate_pool_id": resolved.get("candidate_pool_id"),
+                    "recall_mode": resolved.get("recall_mode"),
+                    "filtered_by_min_data_confidence": len(opportunities) == 0,
+                },
+                "notes": notes,
+            }
+
+        rows = self._fetch_category_opportunity_rows(
+            domain=domain,
+            category_id=request.category_id,
+            category_path=request.category_path,
+            include_descendants=request.include_descendants,
+            window_days=request.window_days,
+            limit=max(request.limit * 8, 80),
+        )
+        max_sales_window_sum = max([_safe_float(row.get("sales_window_sum")) for row in rows] or [1.0])
+        cards = [
+            self._build_category_opportunity_card(
+                row=row,
+                marketplace=marketplace,
+                window_days=request.window_days,
+                max_sales_window_sum=max_sales_window_sum,
+                include_expandable=request.include_expandable,
+            )
+            for row in rows
+        ]
+        cards.sort(key=lambda item: item["opportunity_score"], reverse=True)
+        opportunities = self._filter_opportunities_by_confidence(
+            cards,
+            min_data_confidence=request.min_data_confidence,
+            limit=request.limit,
+        )
+        return {
+            "marketplace": marketplace,
+            "domain": domain,
+            "platform": request.platform,
+            "query": request.query,
+            "category_id": request.category_id,
+            "category_path": request.category_path,
+            "opportunity_count": len(opportunities),
+            "opportunities": opportunities,
+            "diagnostics": {
+                "scanned_category_count": len(rows),
+                "filtered_by_min_data_confidence": len(opportunities) < min(len(cards), request.limit),
+                "window_days": request.window_days,
+            },
+            "notes": notes,
         }
 
     def get_candidate_expansion_status(self, request: CandidateExpansionJobStatusRequest) -> dict[str, Any]:
@@ -1650,7 +2396,10 @@ class ProductThemeService:
                     [domain, request.statuses or None, request.statuses or None, request.limit],
                 )
 
-        jobs = [self._format_candidate_expansion_job(row) for row in rows]
+            jobs = [self._format_candidate_expansion_job(row) for row in rows]
+            for job in jobs:
+                job["data_readiness"] = self._fetch_candidate_expansion_data_readiness(conn, job)
+
         return {
             "marketplace": marketplace,
             "domain": domain,
@@ -1659,7 +2408,8 @@ class ProductThemeService:
             "jobs": jobs,
             "notes": [
                 "queued and waiting_token jobs do not consume Keepa tokens until collector reserves them",
-                "completed jobs may require DuckDB-to-PostgreSQL sync before resolve_candidates sees new local candidates",
+                "completed means discovered ASINs are visible in PostgreSQL registry; check data_readiness.analysis_ready before running stats or benchmark analysis",
+                "data_readiness distinguishes registry sync, product hydration, and serving feature sync readiness",
             ],
         }
 
@@ -3229,6 +3979,70 @@ class ProductThemeService:
             "items": enriched_rows,
         }
 
+    def get_product_forecast_explain(self, request: ProductForecastExplainRequest) -> dict[str, Any]:
+        drilldown = self.get_top_asin_drilldown(request)
+        items = drilldown.get("items") if isinstance(drilldown.get("items"), list) else []
+        top_n = request.top_n or 10
+        status_counts: dict[str, int] = {}
+        explanations: list[dict[str, Any]] = []
+        model_hit_count = 0
+        summary_lines: list[str] = []
+
+        for item in items[:top_n]:
+            if not isinstance(item, dict):
+                continue
+            forecast = item.get("sales_forecast") if isinstance(item.get("sales_forecast"), dict) else {}
+            status = str(forecast.get("status") or "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+            has_model = forecast.get("predicted_weekly_sales_w1") is not None or forecast.get("predicted_weekly_sales_w4") is not None
+            if has_model:
+                model_hit_count += 1
+            driver_summary = str(forecast.get("driver_summary_text") or "").strip()
+            if driver_summary:
+                summary_lines.append(driver_summary)
+
+            explanations.append(
+                {
+                    "asin": item.get("asin"),
+                    "title": item.get("product_title"),
+                    "brand": item.get("brand"),
+                    "category": item.get("category"),
+                    "forecast_status": status,
+                    "predicted_weekly_sales_w1": forecast.get("predicted_weekly_sales_w1"),
+                    "predicted_weekly_sales_w4": forecast.get("predicted_weekly_sales_w4"),
+                    "predicted_growth_delta_w4_minus_w1": forecast.get("predicted_growth_delta_w4_minus_w1"),
+                    "predicted_growth_ratio_w4_over_w1": forecast.get("predicted_growth_ratio_w4_over_w1"),
+                    "predicted_rank_w1_within_domain": forecast.get("predicted_rank_w1_within_domain"),
+                    "predicted_rank_w4_within_domain": forecast.get("predicted_rank_w4_within_domain"),
+                    "model_config_name_w1": forecast.get("model_config_name_w1"),
+                    "model_config_name_w4": forecast.get("model_config_name_w4"),
+                    "primary_driver_feature": forecast.get("primary_driver_feature"),
+                    "primary_driver_label": forecast.get("primary_driver_label"),
+                    "primary_driver_direction": forecast.get("primary_driver_direction"),
+                    "primary_driver_contribution_share": forecast.get("primary_driver_contribution_share"),
+                    "top_feature_contributions": forecast.get("top_feature_contributions") or [],
+                    "driver_summary_text": driver_summary or None,
+                    "forecast_notes": forecast.get("notes") or [],
+                }
+            )
+
+        forecast_meta = drilldown.get("sales_forecast_meta") if isinstance(drilldown.get("sales_forecast_meta"), dict) else {}
+        return {
+            "source_tool": "product_forecast_explain",
+            "source_detail_tool": "top_asin_drilldown",
+            "marketplace": drilldown.get("marketplace"),
+            "domain": drilldown.get("domain"),
+            "candidate_pool": drilldown.get("candidate_pool"),
+            "window_days": drilldown.get("window_days"),
+            "sales_forecast_meta": forecast_meta,
+            "forecast_status": status_counts,
+            "forecast_model_hit_count": model_hit_count,
+            "forecast_model_summary_text": "Top ASIN 中有 %s 个包含训练模型预测字段。" % model_hit_count,
+            "asin_forecast_explanations": explanations,
+            "driver_summary_text": "\n".join(summary_lines),
+            "notes": forecast_meta.get("notes") if isinstance(forecast_meta.get("notes"), list) else [],
+        }
+
     def get_asin_history_timeseries(self, request: AsinHistoryTimeseriesRequest) -> dict[str, Any]:
         domain, marketplace = _normalize_marketplace(request.marketplace)
         asins = _sanitize_asins(request.asins)
@@ -4418,6 +5232,15 @@ def candidate_expansion_status(request: CandidateExpansionJobStatusRequest) -> d
     )
 
 
+@app.post("/api/product-theme/opportunity-discovery")
+async def opportunity_discovery(request: OpportunityDiscoveryRequest) -> dict[str, Any]:
+    return _success_response(
+        endpoint="/api/product-theme/opportunity-discovery",
+        message="opportunity discovery cards ready",
+        data=await service.discover_opportunities(request),
+    )
+
+
 @app.post("/api/product-theme/candidate-pool-stats")
 def candidate_pool_stats(request: CandidatePoolRequest) -> dict[str, Any]:
     return _success_response(
@@ -4442,6 +5265,15 @@ def candidate_pool_weak_forecast(request: WeakForecastRequest) -> dict[str, Any]
         endpoint="/api/product-theme/candidate-pool-weak-forecast",
         message="candidate pool weak forecast ready",
         data=service.get_candidate_pool_weak_forecast(request),
+    )
+
+
+@app.post("/api/product-theme/product-forecast-explain")
+def product_forecast_explain(request: ProductForecastExplainRequest) -> dict[str, Any]:
+    return _success_response(
+        endpoint="/api/product-theme/product-forecast-explain",
+        message="product forecast explanations ready",
+        data=service.get_product_forecast_explain(request),
     )
 
 
