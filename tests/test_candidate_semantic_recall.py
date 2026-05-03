@@ -26,6 +26,7 @@ from data_platform.api.product_theme_api import (
     _score_candidate,
     _score_category_match,
 )
+from data_platform.api.seller_scope import evaluate_seller_scope
 
 
 def make_record(
@@ -513,6 +514,87 @@ class CandidateSemanticRecallTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             OpportunityDiscoveryRequest(platform="TikTok")
 
+    def test_seller_scope_blocks_digital_media_categories(self) -> None:
+        service = ProductThemeService()
+        rows = [
+            {
+                "category_id": 1,
+                "category_path": "Digital Software > Antivirus & Security > Antivirus",
+                "category_name": "Antivirus",
+            },
+            {
+                "category_id": 2,
+                "category_path": "Movies & TV > Movies",
+                "category_name": "Movies",
+            },
+            {
+                "category_id": 3,
+                "category_path": "Sports & Outdoors > Golf > Golf Balls",
+                "category_name": "Golf Balls",
+            },
+        ]
+
+        kept, summary = service._filter_category_opportunity_rows_by_seller_scope(rows)
+
+        self.assertEqual([row["category_id"] for row in kept], [3])
+        self.assertEqual(summary["filtered_count"], 2)
+        self.assertEqual(summary["reason_counts"]["digital_or_licensed_goods"], 1)
+        self.assertEqual(summary["reason_counts"]["copyright_media"], 1)
+
+    def test_seller_scope_allows_physical_opportunity_categories(self) -> None:
+        for category_path in [
+            "Clothing, Shoes & Jewelry > Men > Shirts",
+            "Sports & Outdoors > Golf > Golf Balls",
+            "Electronics > Headphones, Earbuds & Accessories > Earbud Headphones",
+        ]:
+            self.assertTrue(evaluate_seller_scope(category_path=category_path).allowed)
+
+        self.assertFalse(evaluate_seller_scope(query="杀毒软件").allowed)
+        self.assertFalse(evaluate_seller_scope(query="电影").allowed)
+
+    def test_unclassified_opportunity_rows_do_not_become_unknown_cards(self) -> None:
+        service = ProductThemeService()
+        rows = [
+            {
+                "category_id": None,
+                "category_path": "UNKNOWN",
+                "category_name": "UNKNOWN",
+                "candidate_count": 310,
+                "row_count": 3006,
+            },
+            {
+                "category_id": 3408951,
+                "category_path": "Sports & Outdoors > Hunting & Fishing > Fishing",
+                "category_name": "Fishing",
+                "candidate_count": 34,
+                "row_count": 334,
+            },
+            {
+                "category_id": None,
+                "category_path": "Home & Kitchen > Storage",
+                "category_name": "Storage",
+                "candidate_count": 12,
+                "row_count": 120,
+            },
+        ]
+
+        kept, summary = service._filter_unclassified_category_opportunity_rows(rows)
+
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(summary["filtered_count"], 1)
+        self.assertEqual(summary["reason"], "missing_category_id_path_and_name")
+        self.assertEqual(kept[0]["category_name"], "Fishing")
+
+    def test_candidate_expansion_rejects_out_of_scope_query(self) -> None:
+        service = ProductThemeService()
+        request = CandidateExpansionJobRequest(product_query="antivirus software license", recall_mode="keyword")
+
+        with self.assertRaises(HTTPException) as context:
+            service.create_candidate_expansion_job(request)
+
+        self.assertEqual(context.exception.status_code, 400)
+        self.assertIn("seller_scope", context.exception.detail)
+
     def test_product_forecast_explain_request_defaults_to_top_10(self) -> None:
         request = ProductForecastExplainRequest(candidate_asins=["B001", "B002"], marketplace="US")
 
@@ -538,6 +620,95 @@ class CandidateSemanticRecallTests(unittest.TestCase):
         )
 
         self.assertEqual(score, 75.0)
+
+    def test_category_opportunity_card_explains_metrics(self) -> None:
+        service = ProductThemeService()
+        card = service._build_category_opportunity_card(
+            row={
+                "category_id": 12345,
+                "category_path": "Sports & Outdoors > Sports > Golf > Golf Balls",
+                "category_name": "Golf Balls",
+                "candidate_count": 12,
+                "row_count": 120,
+                "trend_rows": 60,
+                "sales_window_sum": 3000.0,
+                "sales_mean_7": 14.0,
+                "sales_mean_prev": 10.0,
+                "trend_mean_7": 30.0,
+                "trend_mean_prev": 20.0,
+                "price_p50": 39.99,
+                "review_count_median": 100,
+                "offer_count_avg": 0.61,
+                "max_date": "2026-05-02",
+            },
+            marketplace="US",
+            window_days=30,
+            max_sales_window_sum=3000.0,
+            include_expandable=True,
+        )
+
+        self.assertEqual(card["evidence_summary"]["candidate_count"], 12)
+        self.assertEqual(card["evidence_summary"]["row_count"], 120)
+        self.assertEqual(card["metric_explanations"]["sales_window_sum"]["candidate_count"], 12)
+        self.assertEqual(card["metric_explanations"]["sales_window_sum"]["row_count"], 120)
+        self.assertIn("不要默认加美元符号", card["metric_explanations"]["sales_window_sum"]["display_guidance"])
+        self.assertEqual(
+            card["metric_explanations"]["opportunity_score"]["weights"]["demand_score"],
+            0.20,
+        )
+        self.assertIn("不是供应商数量", card["metric_explanations"]["offer_count_avg"]["plain_language"])
+
+    def test_opportunity_metric_definitions_include_offer_meaning(self) -> None:
+        service = ProductThemeService()
+        definitions = service._opportunity_metric_definitions()
+
+        self.assertIn("20%需求", definitions["opportunity_score"]["formula"])
+        self.assertIn("candidate_count", definitions["sales_window_sum"]["sample_scope_fields"])
+        self.assertIn("不要默认加美元符号", definitions["sales_window_sum"]["display_guidance"])
+        self.assertIn("不是供应商数量", definitions["offer_count_avg"]["meaning"])
+
+    def test_opportunity_llm_presentation_includes_table_and_explanations(self) -> None:
+        service = ProductThemeService()
+        card = service._build_category_opportunity_card(
+            row={
+                "category_id": 12345,
+                "category_path": "Sports & Outdoors > Sports > Golf > Golf Balls",
+                "category_name": "Golf Balls",
+                "candidate_count": 12,
+                "row_count": 120,
+                "trend_rows": 60,
+                "sales_window_sum": 3000.0,
+                "sales_mean_7": 14.0,
+                "sales_mean_prev": 10.0,
+                "trend_mean_7": 30.0,
+                "trend_mean_prev": 20.0,
+                "price_p50": 39.99,
+                "review_count_median": 100,
+                "offer_count_avg": 0.61,
+                "max_date": "2026-05-02",
+            },
+            marketplace="US",
+            window_days=30,
+            max_sales_window_sum=3000.0,
+            include_expandable=True,
+        )
+        result = service._with_opportunity_llm_presentation(
+            {
+                "marketplace": "US",
+                "platform": "Amazon",
+                "opportunity_count": 1,
+                "opportunities": [card],
+                "metric_definitions": service._opportunity_metric_definitions(),
+            }
+        )
+
+        text = result["opportunity_cards_text"]
+        self.assertIn("| 排名 | 机会主题 | 得分 | 类目路径 | 窗口销量估算 | 样本ASIN数 | 日数据行数 |", text)
+        self.assertIn("字段解释", text)
+        self.assertIn("样本ASIN数=12", text)
+        self.assertIn("不要把窗口销量估算渲染成美元金额", text)
+        self.assertEqual(result["opportunities_for_llm"][0]["candidate_count"], 12)
+        self.assertEqual(result["opportunities_for_llm"][0]["row_count"], 120)
 
 
 if __name__ == "__main__":

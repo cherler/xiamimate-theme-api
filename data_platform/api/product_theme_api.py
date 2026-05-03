@@ -40,6 +40,7 @@ from data_platform.api.theme_api_auth import (
     record_api_usage,
     resolve_api_key,
 )
+from data_platform.api.seller_scope import SellerScopeDecision, evaluate_seller_scope
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -88,6 +89,15 @@ DEFAULT_MIN_CANDIDATE_POOL_SIZE = 8
 DEFAULT_TARGET_CANDIDATE_POOL_SIZE = 20
 DEFAULT_DOMINANT_CATEGORY_SHARE_THRESHOLD = 0.7
 CANDIDATE_EXPANSION_ACTIVE_STATUSES = ("queued", "waiting_token", "discovering", "hydrating", "syncing")
+OPPORTUNITY_SCORE_WEIGHTS = {
+    "demand_score": 0.20,
+    "trend_score": 0.20,
+    "competition_headroom_score": 0.15,
+    "price_fit_score": 0.15,
+    "forecast_growth_score": 0.15,
+    "coverage_gap_score": 0.10,
+    "evidence_quality_score": 0.05,
+}
 
 QUERY_MODIFIER_TOKENS = {
     "adjustable",
@@ -1589,6 +1599,19 @@ class ProductThemeService:
                 detail="category_path cannot be used as an execution key; call category_resolve first and pass category_id",
             )
 
+        scope_decision = evaluate_seller_scope(
+            category_path=request.category_path,
+            query=request.product_query,
+        )
+        if not scope_decision.allowed:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "candidate expansion is outside the configured small cross-border seller product scope",
+                    "seller_scope": scope_decision.as_dict(),
+                },
+            )
+
     def _candidate_expansion_category_lock_key(self, *, domain: int, category_id: int, include_descendants: bool) -> str:
         include_flag = 1 if include_descendants else 0
         return f"candidate-expansion:domain:{domain}:category:{category_id}:desc:{include_flag}"
@@ -1903,15 +1926,236 @@ class ProductThemeService:
 
     def _build_opportunity_score(self, breakdown: dict[str, float]) -> float:
         return round(
-            0.20 * breakdown.get("demand_score", 0.0)
-            + 0.20 * breakdown.get("trend_score", 0.0)
-            + 0.15 * breakdown.get("competition_headroom_score", 0.0)
-            + 0.15 * breakdown.get("price_fit_score", 0.0)
-            + 0.15 * breakdown.get("forecast_growth_score", 0.0)
-            + 0.10 * breakdown.get("coverage_gap_score", 0.0)
-            + 0.05 * breakdown.get("evidence_quality_score", 0.0),
+            sum(OPPORTUNITY_SCORE_WEIGHTS[key] * breakdown.get(key, 0.0) for key in OPPORTUNITY_SCORE_WEIGHTS),
             2,
         )
+
+    def _build_opportunity_score_explanation(self, breakdown: dict[str, float]) -> dict[str, Any]:
+        weighted_components = {
+            key: {
+                "score": round(_safe_float(breakdown.get(key)), 2),
+                "weight": weight,
+                "weighted_points": round(_safe_float(breakdown.get(key)) * weight, 2),
+            }
+            for key, weight in OPPORTUNITY_SCORE_WEIGHTS.items()
+        }
+        return {
+            "formula": "sum(component_score_0_to_100 * component_weight)",
+            "weights": dict(OPPORTUNITY_SCORE_WEIGHTS),
+            "components": weighted_components,
+            "plain_language": (
+                "机会得分是 0-100 的综合排序分，不是单一销量排名；它综合需求规模、趋势动能、"
+                "竞争空间、价格适配、预测增长、补池空间和证据质量。"
+            ),
+        }
+
+    def _opportunity_metric_definitions(self) -> dict[str, Any]:
+        return {
+            "opportunity_score": {
+                "label": "机会得分",
+                "meaning": "0-100 综合排序分，用于比较机会优先级，不代表确定收益。",
+                "formula": "20%需求 + 20%趋势 + 15%竞争空间 + 15%价格适配 + 15%预测增长 + 10%覆盖差距 + 5%证据质量",
+            },
+            "sales_window_sum": {
+                "label": "窗口销量",
+                "meaning": "当前本地 serving 表 estimated_daily_sales 在窗口期内的合计。",
+                "formula": "sum(estimated_daily_sales) over candidate ASIN daily rows in window_days",
+                "display_guidance": "按销量估算/销售信号展示，不要默认加美元符号；只有金额字段明确为 GMV/销售额时才使用货币格式。",
+                "sample_scope_fields": ["candidate_count", "row_count", "window_days"],
+            },
+            "sales_momentum_pct": {
+                "label": "销量增长",
+                "meaning": "最近 7 天日均 estimated_daily_sales 相比窗口前段日均值的变化率。",
+                "formula": "(sales_mean_7 - sales_mean_prev) / sales_mean_prev * 100",
+            },
+            "trend_momentum_pct": {
+                "label": "趋势增长",
+                "meaning": "最近 7 天 Google Trends 均值相比窗口前段均值的变化率。",
+                "formula": "(trend_mean_7 - trend_mean_prev) / trend_mean_prev * 100",
+            },
+            "offer_count_avg": {
+                "label": "竞争强度",
+                "meaning": "窗口内 ASIN-日粒度的 Amazon offer 数均值，来自 new_offer_count + used_offer_count；Offer 是前台可购买报价/卖家报价，不是供应商数量。",
+                "formula": "avg(new_offer_count + used_offer_count) over candidate ASIN daily rows in window_days",
+                "interpretation": "数值越低通常表示同一商品上的活跃报价更少，但仍需结合品牌、评论数、FBA/FBM 和真实搜索页竞争判断。",
+            },
+            "data_confidence": {
+                "label": "数据置信度",
+                "meaning": "按候选 ASIN 数、窗口日数据行数、趋势覆盖率评估证据充足度。",
+                "formula": "high: candidate_count>=12 and row_count>=120 and trend_coverage>=0.35; medium: candidate_count>=5 and row_count>=30; otherwise low",
+            },
+        }
+
+    def _build_category_metric_explanations(
+        self,
+        *,
+        score_breakdown: dict[str, float],
+        candidate_count: int,
+        row_count: int,
+        window_days: int,
+        sales_window_sum: float,
+        sales_mean_7: float,
+        sales_mean_prev: float,
+        sales_momentum_pct: float,
+        trend_mean_7: float,
+        trend_mean_prev: float,
+        trend_momentum_pct: float,
+        offer_count_avg: float,
+        trend_coverage: float,
+    ) -> dict[str, Any]:
+        return {
+            "opportunity_score": self._build_opportunity_score_explanation(score_breakdown),
+            "sales_window_sum": {
+                "formula": "sum(estimated_daily_sales) over candidate ASIN daily rows in window_days",
+                "candidate_count": candidate_count,
+                "row_count": row_count,
+                "window_days": window_days,
+                "value": round(sales_window_sum, 2),
+                "display_guidance": "不要默认加美元符号；这是 estimated_daily_sales 的窗口合计，不是明确 GMV 字段。",
+                "plain_language": f"该值来自 {candidate_count} 个候选 ASIN 在近 {window_days} 天内的 {row_count} 条日粒度数据。",
+            },
+            "sales_momentum_pct": {
+                "formula": "(sales_mean_7 - sales_mean_prev) / sales_mean_prev * 100",
+                "recent_7d_daily_avg": round(sales_mean_7, 4),
+                "previous_window_daily_avg": round(sales_mean_prev, 4),
+                "value_pct": round(sales_momentum_pct, 2),
+            },
+            "trend_momentum_pct": {
+                "formula": "(trend_mean_7 - trend_mean_prev) / trend_mean_prev * 100",
+                "recent_7d_trend_avg": round(trend_mean_7, 4),
+                "previous_window_trend_avg": round(trend_mean_prev, 4),
+                "value_pct": round(trend_momentum_pct, 2),
+                "trend_coverage": trend_coverage,
+            },
+            "offer_count_avg": {
+                "formula": "avg(new_offer_count + used_offer_count) over candidate ASIN daily rows in window_days",
+                "value": round(offer_count_avg, 2),
+                "plain_language": "Offer 是 Amazon 上同一 ASIN 的可购买报价/卖家报价，不是供应商数量；这里取窗口内 ASIN-日平均。",
+            },
+        }
+
+    def _build_query_metric_explanations(
+        self,
+        *,
+        score_breakdown: dict[str, float],
+        candidate_count: int,
+        window_days: int,
+        sales_window_sum: float,
+        sales_window_avg: float,
+        trend_wow: float,
+        trend_coverage: float,
+        offer_count_median: float,
+    ) -> dict[str, Any]:
+        return {
+            "opportunity_score": self._build_opportunity_score_explanation(score_breakdown),
+            "sales_window_sum": {
+                "formula": "sum(estimated_daily_sales) over resolved candidate ASIN daily rows in window_days",
+                "candidate_count": candidate_count,
+                "window_days": window_days,
+                "value": round(sales_window_sum, 2),
+                "daily_avg": round(sales_window_avg, 2),
+                "display_guidance": "不要默认加美元符号；这是 estimated_daily_sales 的窗口合计，不是明确 GMV 字段。",
+            },
+            "trend_momentum_pct": {
+                "formula": "trend_wow from candidate_pool_trends, expressed as percentage points in current response",
+                "value_pct": round(trend_wow, 2),
+                "trend_coverage": trend_coverage,
+            },
+            "offer_count_median": {
+                "formula": "median offer count across resolved candidate pool",
+                "value": round(offer_count_median, 2),
+                "plain_language": "Offer 是 Amazon 上同一 ASIN 的可购买报价/卖家报价，不是供应商数量。",
+            },
+        }
+
+    def _build_opportunity_llm_presentation(self, result: dict[str, Any]) -> dict[str, Any]:
+        opportunities = list(result.get("opportunities") or [])
+        metric_definitions = result.get("metric_definitions") or self._opportunity_metric_definitions()
+        lines = [
+            "## 机会发现结果（按工具实际返回，不要补齐不存在的行）",
+            "",
+            f"市场: {result.get('marketplace') or 'US'} | 平台: {result.get('platform') or 'Amazon'} | 实际返回机会数: {len(opportunities)}",
+            "",
+            "| 排名 | 机会主题 | 得分 | 类目路径 | 窗口销量估算 | 样本ASIN数 | 日数据行数 | 销量增长 | 趋势增长 | 竞争Offer | 置信度 |",
+            "|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---|",
+        ]
+        compact_cards: list[dict[str, Any]] = []
+        for index, card in enumerate(opportunities, start=1):
+            evidence = card.get("evidence_summary") or {}
+            explanations = card.get("metric_explanations") or {}
+            sales_explanation = explanations.get("sales_window_sum") or {}
+            offer_value = evidence.get("offer_count_avg")
+            if offer_value is None:
+                offer_value = evidence.get("offer_count_median")
+            row_count = evidence.get("row_count", sales_explanation.get("row_count"))
+            candidate_count = evidence.get("candidate_count", sales_explanation.get("candidate_count"))
+            sales_window_sum = evidence.get("sales_window_sum")
+            sales_momentum = evidence.get("sales_momentum_pct")
+            trend_momentum = evidence.get("trend_momentum_pct", evidence.get("trend_wow"))
+            lines.append(
+                "| {rank} | {title} | {score:.2f} | {path} | {sales} | {asins} | {rows} | {sales_growth} | {trend_growth} | {offer} | {confidence} |".format(
+                    rank=index,
+                    title=str(card.get("title") or ""),
+                    score=_safe_float(card.get("opportunity_score")),
+                    path=str(card.get("category_path") or "-"),
+                    sales="-" if sales_window_sum is None else f"{_safe_float(sales_window_sum):,.2f}",
+                    asins="-" if candidate_count is None else str(candidate_count),
+                    rows="-" if row_count is None else str(row_count),
+                    sales_growth="-" if sales_momentum is None else f"{_safe_float(sales_momentum):+.2f}%",
+                    trend_growth="-" if trend_momentum is None else f"{_safe_float(trend_momentum):+.2f}%",
+                    offer="-" if offer_value is None else f"{_safe_float(offer_value):.2f}",
+                    confidence=str(card.get("data_confidence") or "-"),
+                )
+            )
+            compact_cards.append(
+                {
+                    "rank": index,
+                    "title": card.get("title"),
+                    "category_path": card.get("category_path"),
+                    "opportunity_score": card.get("opportunity_score"),
+                    "candidate_count": candidate_count,
+                    "row_count": row_count,
+                    "sales_window_sum": sales_window_sum,
+                    "sales_momentum_pct": sales_momentum,
+                    "trend_momentum_pct": trend_momentum,
+                    "offer_count": offer_value,
+                    "data_confidence": card.get("data_confidence"),
+                    "metric_explanations": card.get("metric_explanations"),
+                }
+            )
+
+        lines.extend(
+            [
+                "",
+                "### 字段解释（回复必须包含）",
+                f"- 机会得分: {metric_definitions['opportunity_score']['formula']}。这是 0-100 综合排序分，不代表确定收益。",
+                f"- 窗口销量估算: {metric_definitions['sales_window_sum']['meaning']}；公式: {metric_definitions['sales_window_sum']['formula']}。展示时不要默认加美元符号。",
+                "- 多少个商品参与统计: 看表格里的“样本ASIN数”；多少条日数据参与统计: 看“日数据行数”。例如样本ASIN数=12、日数据行数=120，表示 12 个候选 ASIN 在窗口内共 120 条 ASIN-日记录。",
+                f"- 销量增长: {metric_definitions['sales_momentum_pct']['formula']}。",
+                f"- 趋势增长: {metric_definitions['trend_momentum_pct']['formula']}。",
+                f"- 竞争Offer: {metric_definitions['offer_count_avg']['meaning']} {metric_definitions['offer_count_avg']['interpretation']}",
+                f"- 数据置信度: {metric_definitions['data_confidence']['formula']}。",
+                "",
+                "展示规则: 只展示工具实际返回的机会，不要补齐到 10 行；不要把窗口销量估算渲染成美元金额。",
+            ]
+        )
+        return {
+            "opportunity_cards_text": "\n".join(lines),
+            "opportunities_for_llm": compact_cards,
+            "display_rules": [
+                "must_include_metric_table",
+                "must_include_field_explanations",
+                "do_not_pad_missing_opportunities",
+                "do_not_format_estimated_daily_sales_as_currency",
+            ],
+        }
+
+    def _with_opportunity_llm_presentation(self, result: dict[str, Any]) -> dict[str, Any]:
+        result["metric_definitions"] = result.get("metric_definitions") or self._opportunity_metric_definitions()
+        result["llm_presentation"] = self._build_opportunity_llm_presentation(result)
+        result["opportunity_cards_text"] = result["llm_presentation"]["opportunity_cards_text"]
+        result["opportunities_for_llm"] = result["llm_presentation"]["opportunities_for_llm"]
+        return result
 
     def _make_opportunity_id(self, *parts: Any) -> str:
         key = ":".join(str(part or "") for part in parts)
@@ -1927,6 +2171,107 @@ class ProductThemeService:
         min_rank = _confidence_rank(min_data_confidence)
         filtered = [card for card in cards if _confidence_rank(str(card.get("data_confidence") or "low")) >= min_rank]
         return filtered[:limit]
+
+    def _seller_scope_blocked_response(
+        self,
+        *,
+        request: OpportunityDiscoveryRequest,
+        marketplace: str,
+        domain: int,
+        decision: SellerScopeDecision,
+    ) -> dict[str, Any]:
+        result = {
+            "marketplace": marketplace,
+            "domain": domain,
+            "platform": request.platform,
+            "query": request.query,
+            "category_id": request.category_id,
+            "category_path": request.category_path,
+            "opportunity_count": 0,
+            "opportunities": [],
+            "metric_definitions": self._opportunity_metric_definitions(),
+            "diagnostics": {
+                "seller_scope": decision.as_dict(),
+                "seller_scope_filtered": True,
+            },
+            "notes": [
+                "request is outside the configured small cross-border seller product scope",
+                "digital/licensed/copyright media and restricted goods are filtered before opportunity analysis",
+            ],
+        }
+        return self._with_opportunity_llm_presentation(result)
+
+    def _filter_category_opportunity_rows_by_seller_scope(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        kept: list[dict[str, Any]] = []
+        blocked_samples: list[dict[str, Any]] = []
+        reason_counts: dict[str, int] = {}
+        for row in rows:
+            decision = evaluate_seller_scope(
+                category_path=row.get("category_path"),
+                category_name=row.get("category_name"),
+            )
+            if decision.allowed:
+                row["seller_scope"] = decision.as_dict()
+                kept.append(row)
+                continue
+            reason_counts[decision.reason_code] = reason_counts.get(decision.reason_code, 0) + 1
+            if len(blocked_samples) < 5:
+                blocked_samples.append(
+                    {
+                        "category_id": row.get("category_id"),
+                        "category_path": row.get("category_path"),
+                        "reason_code": decision.reason_code,
+                        "matched_terms": list(decision.matched_terms),
+                    }
+                )
+
+        return kept, {
+            "policy_version": evaluate_seller_scope().policy_version,
+            "input_count": len(rows),
+            "kept_count": len(kept),
+            "filtered_count": len(rows) - len(kept),
+            "reason_counts": reason_counts,
+            "blocked_samples": blocked_samples,
+        }
+
+    def _filter_unclassified_category_opportunity_rows(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        kept: list[dict[str, Any]] = []
+        dropped_samples: list[dict[str, Any]] = []
+        for row in rows:
+            category_id = row.get("category_id")
+            category_path = str(row.get("category_path") or "").strip()
+            category_name = str(row.get("category_name") or "").strip()
+            has_readable_category = any(
+                value and value.upper() != "UNKNOWN"
+                for value in (category_path, category_name)
+            )
+            if category_id is None and not has_readable_category:
+                if len(dropped_samples) < 5:
+                    dropped_samples.append(
+                        {
+                            "category_id": category_id,
+                            "category_path": category_path or None,
+                            "category_name": category_name or None,
+                            "candidate_count": row.get("candidate_count"),
+                            "row_count": row.get("row_count"),
+                        }
+                    )
+                continue
+            kept.append(row)
+
+        return kept, {
+            "input_count": len(rows),
+            "kept_count": len(kept),
+            "filtered_count": len(rows) - len(kept),
+            "reason": "missing_category_id_path_and_name",
+            "dropped_samples": dropped_samples,
+        }
 
     def _fetch_category_opportunity_rows(
         self,
@@ -1945,6 +2290,35 @@ class ProductThemeService:
                 """
                 WITH RECURSIVE category_seed AS MATERIALIZED (
                     SELECT %s::BIGINT AS category_id
+                ),
+                category_tree(category_id, domain, parent_id, category_path, category_name, path_depth) AS MATERIALIZED (
+                    SELECT
+                        c.category_id,
+                        c.domain,
+                        c.parent_id,
+                        c.category_en::TEXT AS category_path,
+                        c.category_en::TEXT AS category_name,
+                        1 AS path_depth
+                    FROM sync.keepa_category_registry c
+                    WHERE c.domain = %s
+                      AND c.parent_id IS NULL
+
+                    UNION ALL
+
+                    SELECT
+                        child.category_id,
+                        child.domain,
+                        child.parent_id,
+                        CONCAT_WS(' > ', parent.category_path, child.category_en)::TEXT AS category_path,
+                        child.category_en::TEXT AS category_name,
+                        parent.path_depth + 1 AS path_depth
+                    FROM sync.keepa_category_registry child
+                    JOIN category_tree parent
+                      ON child.domain = parent.domain
+                     AND child.parent_id = parent.category_id
+                    WHERE child.domain = %s
+                      AND child.category_id <> parent.category_id
+                      AND parent.path_depth < 12
                 ),
                 category_subtree(category_id) AS MATERIALIZED (
                     SELECT category_id
@@ -1971,12 +2345,20 @@ class ProductThemeService:
                         r.asin,
                         r.domain,
                         r.category_id,
-                        NULLIF(r.category_path, '') AS category_path,
-                        NULLIF(r.category, '') AS category_name,
+                                                COALESCE(NULLIF(r.category_path, ''), ct.category_path) AS category_path,
+                                                COALESCE(NULLIF(r.category, ''), ct.category_name) AS category_name,
                         COALESCE(r.is_active, TRUE) AS is_active
                     FROM sync.keepa_asin_registry r
+                                        LEFT JOIN category_tree ct
+                                            ON ct.domain = r.domain
+                                         AND ct.category_id = r.category_id
                     WHERE r.domain = %s
                       AND COALESCE(r.is_active, TRUE) = TRUE
+                                            AND (
+                                                    r.category_id IS NOT NULL
+                                                    OR NULLIF(r.category_path, '') IS NOT NULL
+                                                    OR NULLIF(r.category, '') IS NOT NULL
+                                            )
                       AND (
                           %s::BIGINT IS NULL
                           OR r.category_id IN (SELECT category_id FROM category_subtree)
@@ -2039,6 +2421,8 @@ class ProductThemeService:
                 """,
                 [
                     category_id,
+                    domain,
+                    domain,
                     domain,
                     include_descendants,
                     domain,
@@ -2108,11 +2492,16 @@ class ProductThemeService:
             "category_id": _safe_int(row.get("category_id")) if row.get("category_id") is not None else None,
             "category_path": category_path,
             "candidate_pool_id": None,
+            "seller_scope": row.get("seller_scope") or evaluate_seller_scope(
+                category_path=category_path,
+                category_name=category_name,
+            ).as_dict(),
             "opportunity_score": self._build_opportunity_score(score_breakdown),
             "score_breakdown": score_breakdown,
             "evidence_summary": {
                 "window_days": window_days,
                 "candidate_count": candidate_count,
+                "row_count": row_count,
                 "sales_window_sum": round(sales_window_sum, 2),
                 "sales_momentum_pct": round(sales_momentum_pct, 2),
                 "trend_momentum_pct": round(trend_momentum_pct, 2),
@@ -2122,6 +2511,21 @@ class ProductThemeService:
                 "review_count_median": round(review_count_median, 2),
                 "data_max_date": _iso_date_or_none(row.get("max_date")),
             },
+            "metric_explanations": self._build_category_metric_explanations(
+                score_breakdown=score_breakdown,
+                candidate_count=candidate_count,
+                row_count=row_count,
+                window_days=window_days,
+                sales_window_sum=sales_window_sum,
+                sales_mean_7=sales_mean_7,
+                sales_mean_prev=sales_mean_prev,
+                sales_momentum_pct=sales_momentum_pct,
+                trend_mean_7=trend_mean_7,
+                trend_mean_prev=trend_mean_prev,
+                trend_momentum_pct=trend_momentum_pct,
+                offer_count_avg=offer_count_avg,
+                trend_coverage=trend_coverage,
+            ),
             "data_confidence": data_confidence,
             "next_action": {
                 "type": "analyze_theme",
@@ -2184,6 +2588,11 @@ class ProductThemeService:
             "category_id": category_constraint.get("category_id") or request.category_id,
             "category_path": category_constraint.get("category_path") or request.category_path,
             "candidate_pool_id": resolved.get("candidate_pool_id"),
+            "seller_scope": evaluate_seller_scope(
+                category_path=category_constraint.get("category_path") or request.category_path,
+                category_name=_leaf_category_name(category_constraint.get("category_path") or request.category_path),
+                query=title,
+            ).as_dict(),
             "opportunity_score": self._build_opportunity_score(score_breakdown),
             "score_breakdown": score_breakdown,
             "evidence_summary": {
@@ -2207,6 +2616,16 @@ class ProductThemeService:
                 "benchmark_is_precise": (benchmark or {}).get("benchmark_is_precise"),
                 "data_max_date": _iso_date_or_none(stats.get("data_max_date")),
             },
+            "metric_explanations": self._build_query_metric_explanations(
+                score_breakdown=score_breakdown,
+                candidate_count=candidate_count,
+                window_days=request.window_days,
+                sales_window_sum=sales_window_sum,
+                sales_window_avg=sales_window_avg,
+                trend_wow=trend_wow,
+                trend_coverage=trend_coverage,
+                offer_count_median=offer_count_median,
+            ),
             "data_confidence": data_confidence,
             "next_action": {
                 "type": "quick_report",
@@ -2227,7 +2646,21 @@ class ProductThemeService:
         notes = [
             "opportunity discovery MVP is local and read-only; theme-api does not consume Keepa tokens here",
             "scores are directional and should route promising cards into product theme analysis before final selection",
+            "seller_scope_policy=cross_border_sme_v1 filters non-physical, licensed, copyright-media, and restricted goods before ranking",
         ]
+
+        request_scope_decision = evaluate_seller_scope(
+            category_path=request.category_path,
+            category_name=_leaf_category_name(request.category_path),
+            query=request.query,
+        )
+        if not request_scope_decision.allowed:
+            return self._seller_scope_blocked_response(
+                request=request,
+                marketplace=marketplace,
+                domain=domain,
+                decision=request_scope_decision,
+            )
 
         if request.query:
             resolve_request = ResolveCandidatesRequest(
@@ -2243,9 +2676,22 @@ class ProductThemeService:
                 max_candidates=max(50, request.limit * 10),
             )
             resolved = await self.resolve_candidates(resolve_request)
+            category_constraint = resolved.get("category_constraint") or {}
+            resolved_scope_decision = evaluate_seller_scope(
+                category_path=category_constraint.get("category_path") or request.category_path,
+                category_name=_leaf_category_name(category_constraint.get("category_path") or request.category_path),
+                query=request.query,
+            )
+            if not resolved_scope_decision.allowed:
+                return self._seller_scope_blocked_response(
+                    request=request,
+                    marketplace=marketplace,
+                    domain=domain,
+                    decision=resolved_scope_decision,
+                )
             candidate_asins = _sanitize_asins(resolved.get("candidate_asins", []))
             if not candidate_asins:
-                return {
+                return self._with_opportunity_llm_presentation({
                     "marketplace": marketplace,
                     "domain": domain,
                     "platform": request.platform,
@@ -2254,8 +2700,9 @@ class ProductThemeService:
                     "category_path": request.category_path,
                     "opportunity_count": 0,
                     "opportunities": [],
+                    "metric_definitions": self._opportunity_metric_definitions(),
                     "notes": notes + ["no local candidate pool was resolved; queue candidate expansion before analysis"],
-                }
+                })
 
             pool_request = CandidatePoolRequest(
                 candidate_asins=candidate_asins,
@@ -2301,7 +2748,7 @@ class ProductThemeService:
                 min_data_confidence=request.min_data_confidence,
                 limit=request.limit,
             )
-            return {
+            return self._with_opportunity_llm_presentation({
                 "marketplace": marketplace,
                 "domain": domain,
                 "platform": request.platform,
@@ -2310,14 +2757,16 @@ class ProductThemeService:
                 "category_path": request.category_path,
                 "opportunity_count": len(opportunities),
                 "opportunities": opportunities,
+                "metric_definitions": self._opportunity_metric_definitions(),
                 "diagnostics": {
                     "resolved_candidate_count": len(candidate_asins),
                     "candidate_pool_id": resolved.get("candidate_pool_id"),
                     "recall_mode": resolved.get("recall_mode"),
+                    "seller_scope": resolved_scope_decision.as_dict(),
                     "filtered_by_min_data_confidence": len(opportunities) == 0,
                 },
                 "notes": notes,
-            }
+            })
 
         rows = self._fetch_category_opportunity_rows(
             domain=domain,
@@ -2325,8 +2774,10 @@ class ProductThemeService:
             category_path=request.category_path,
             include_descendants=request.include_descendants,
             window_days=request.window_days,
-            limit=max(request.limit * 8, 80),
+            limit=max(request.limit * 12, 160),
         )
+        rows, unclassified_summary = self._filter_unclassified_category_opportunity_rows(rows)
+        rows, seller_scope_summary = self._filter_category_opportunity_rows_by_seller_scope(rows)
         max_sales_window_sum = max([_safe_float(row.get("sales_window_sum")) for row in rows] or [1.0])
         cards = [
             self._build_category_opportunity_card(
@@ -2344,7 +2795,7 @@ class ProductThemeService:
             min_data_confidence=request.min_data_confidence,
             limit=request.limit,
         )
-        return {
+        return self._with_opportunity_llm_presentation({
             "marketplace": marketplace,
             "domain": domain,
             "platform": request.platform,
@@ -2353,13 +2804,16 @@ class ProductThemeService:
             "category_path": request.category_path,
             "opportunity_count": len(opportunities),
             "opportunities": opportunities,
+            "metric_definitions": self._opportunity_metric_definitions(),
             "diagnostics": {
-                "scanned_category_count": len(rows),
+                "scanned_category_count": seller_scope_summary["input_count"],
+                "unclassified_category_filter": unclassified_summary,
+                "seller_scope": seller_scope_summary,
                 "filtered_by_min_data_confidence": len(opportunities) < min(len(cards), request.limit),
                 "window_days": request.window_days,
             },
             "notes": notes,
-        }
+        })
 
     def get_candidate_expansion_status(self, request: CandidateExpansionJobStatusRequest) -> dict[str, Any]:
         domain, marketplace = _normalize_marketplace(request.marketplace)
