@@ -12,6 +12,7 @@ from data_platform.api.product_theme_api import (
     CandidatePoolRequest,
     CandidateExpansionJobRequest,
     CandidateExpansionJobStatusRequest,
+    LaunchBudgetCalculatorRequest,
     OpportunityDiscoveryRequest,
     ProductForecastExplainRequest,
     ProductThemeService,
@@ -25,6 +26,7 @@ from data_platform.api.product_theme_api import (
     _leaf_category_name,
     _score_candidate,
     _score_category_match,
+    _success_response,
 )
 from data_platform.api.seller_scope import evaluate_seller_scope
 
@@ -605,6 +607,55 @@ class CandidateSemanticRecallTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ProductForecastExplainRequest(candidate_asins=["B001"], top_n=30)
 
+    def test_success_response_injects_tool_and_evidence_contract(self) -> None:
+        response = _success_response(
+            endpoint="/api/product-theme/asin-history-timeseries",
+            message="ok",
+            data={
+                "window_days": 90,
+                "items": [
+                    {
+                        "asin": "B001",
+                        "window_summary": {"series_row_count": 45, "coverage_ratio": 0.5},
+                    }
+                ],
+            },
+        )
+
+        data = response["data"]
+        self.assertEqual(data["tool_contract"]["capability"], "asin_history_analysis")
+        self.assertEqual(data["evidence_contract"]["schema_version"], "xiamimate_evidence_contract_v1")
+        self.assertEqual(data["evidence_contract"]["evidence_ledger"][0]["evidence_id"], "asin_history:B001:90d")
+        self.assertEqual(data["evidence_contract"]["evidence_ledger"][0]["allowed_claim_strength"], "directional_signal")
+
+    def test_launch_budget_calculator_returns_deterministic_break_even(self) -> None:
+        service = ProductThemeService()
+        result = service.get_launch_budget_calculation(
+            LaunchBudgetCalculatorRequest(
+                product_theme="Women's Pants",
+                selling_price=22.94,
+                unit_product_cost=6.0,
+                packaging_cost=0.5,
+                inbound_shipping_per_unit=1.5,
+                duty_per_unit=0.3,
+                fba_fee=3.22,
+                referral_fee_rate=0.17,
+                coupon_discount_rate=0.10,
+                return_rate=0.08,
+                monthly_fixed_cost=80,
+                monthly_ad_budget=600,
+                launch_units=300,
+                launch_months=3,
+            )
+        )
+
+        self.assertEqual(result["source_tool"], "launch_budget_calculator")
+        self.assertEqual(result["assumptions"]["selling_price"]["source"], "user_input")
+        self.assertEqual(result["assumptions"]["fixed_startup_cost"]["source"], "default_assumption")
+        self.assertAlmostEqual(result["unit_economics"]["contribution_margin_per_unit"], 3.39, places=2)
+        self.assertAlmostEqual(result["break_even"]["break_even_units_per_day"], 6.68, places=2)
+        self.assertEqual(len(result["scenarios"]), 3)
+
     def test_opportunity_score_uses_design_weights(self) -> None:
         service = ProductThemeService()
         score = service._build_opportunity_score(
@@ -651,12 +702,45 @@ class CandidateSemanticRecallTests(unittest.TestCase):
         self.assertEqual(card["evidence_summary"]["row_count"], 120)
         self.assertEqual(card["metric_explanations"]["sales_window_sum"]["candidate_count"], 12)
         self.assertEqual(card["metric_explanations"]["sales_window_sum"]["row_count"], 120)
-        self.assertIn("不要默认加美元符号", card["metric_explanations"]["sales_window_sum"]["display_guidance"])
+        self.assertIn("单位是销量数量", card["metric_explanations"]["sales_window_sum"]["display_guidance"])
         self.assertEqual(
             card["metric_explanations"]["opportunity_score"]["weights"]["demand_score"],
             0.20,
         )
         self.assertIn("不是供应商数量", card["metric_explanations"]["offer_count_avg"]["plain_language"])
+
+    def test_category_opportunity_card_uses_fine_display_title(self) -> None:
+        service = ProductThemeService()
+        card = service._build_category_opportunity_card(
+            row={
+                "category_id": 12345,
+                "category_path": "Clothing, Shoes & Jewelry > Women > Clothing > Pants",
+                "category_name": "Apparel",
+                "candidate_count": 12,
+                "row_count": 120,
+                "trend_rows": 60,
+                "sales_window_sum": 3000.0,
+                "sales_mean_7": 14.0,
+                "sales_mean_prev": 10.0,
+                "trend_mean_7": 30.0,
+                "trend_mean_prev": 20.0,
+                "price_p50": 39.99,
+                "review_count_median": 100,
+                "offer_count_avg": 0.61,
+                "max_date": "2026-05-02",
+            },
+            marketplace="US",
+            window_days=30,
+            max_sales_window_sum=3000.0,
+            include_expandable=True,
+        )
+
+        self.assertEqual(card["title"], "Women's Pants")
+        self.assertEqual(card["category_name"], "Women's Pants")
+        self.assertEqual(card["next_action"]["request"]["product_query"], "Women's Pants")
+        self.assertEqual(card["next_action"]["request"]["category_id"], 12345)
+        self.assertEqual(card["next_action"]["request"]["category_path"], "Clothing, Shoes & Jewelry > Women > Clothing > Pants")
+        self.assertEqual(card["next_action"]["request"]["recall_mode"], "category")
 
     def test_opportunity_metric_definitions_include_offer_meaning(self) -> None:
         service = ProductThemeService()
@@ -664,7 +748,7 @@ class CandidateSemanticRecallTests(unittest.TestCase):
 
         self.assertIn("20%需求", definitions["opportunity_score"]["formula"])
         self.assertIn("candidate_count", definitions["sales_window_sum"]["sample_scope_fields"])
-        self.assertIn("不要默认加美元符号", definitions["sales_window_sum"]["display_guidance"])
+        self.assertIn("单位是销量数量", definitions["sales_window_sum"]["display_guidance"])
         self.assertIn("不是供应商数量", definitions["offer_count_avg"]["meaning"])
 
     def test_opportunity_llm_presentation_includes_table_and_explanations(self) -> None:
@@ -703,12 +787,107 @@ class CandidateSemanticRecallTests(unittest.TestCase):
         )
 
         text = result["opportunity_cards_text"]
+        self.assertIn("## 机会发现结果", text)
+        self.assertNotIn("按工具实际返回", text)
+        self.assertNotIn("不要补齐", text)
         self.assertIn("| 排名 | 机会主题 | 得分 | 类目路径 | 窗口销量估算 | 样本ASIN数 | 日数据行数 |", text)
         self.assertIn("字段解释", text)
         self.assertIn("样本ASIN数=12", text)
-        self.assertIn("不要把窗口销量估算渲染成美元金额", text)
+        self.assertIn("单位是销量数量，不是金额", text)
         self.assertEqual(result["opportunities_for_llm"][0]["candidate_count"], 12)
         self.assertEqual(result["opportunities_for_llm"][0]["row_count"], 120)
+        self.assertEqual(result["opportunities_for_llm"][0]["opportunity_id"], card["opportunity_id"])
+        self.assertEqual(result["opportunities_for_llm"][0]["source"], "local_category_opportunity_scan")
+        self.assertEqual(result["opportunities_for_llm"][0]["category_id"], 12345)
+        self.assertEqual(result["opportunities_for_llm"][0]["next_action"]["request"]["category_id"], 12345)
+        self.assertEqual(result["opportunities_for_llm"][0]["next_action"]["request"]["category_path"], "Sports & Outdoors > Sports > Golf > Golf Balls")
+        self.assertEqual(result["opportunities_for_llm"][0]["next_action"]["request"]["recall_mode"], "category")
+
+    def test_memory_profile_rerank_keeps_original_order_without_signal(self) -> None:
+        service = ProductThemeService()
+        cards = [
+            {"title": "High Score", "category_path": "Home & Kitchen", "opportunity_score": 90, "data_confidence": "medium"},
+            {"title": "Lower Score", "category_path": "Sports & Outdoors", "opportunity_score": 80, "data_confidence": "medium"},
+        ]
+
+        reranked, summary = service._rerank_opportunities_with_memory_profile(cards, {"market_focus": ["US"]})
+
+        self.assertFalse(summary["personalization_applied"])
+        self.assertEqual([card["title"] for card in reranked], ["High Score", "Lower Score"])
+        self.assertIs(reranked[0], cards[0])
+        self.assertNotIn("memory_profile_rerank", reranked[0])
+
+    def test_memory_profile_rerank_applies_after_base_score_when_signal_exists(self) -> None:
+        service = ProductThemeService()
+        cards = [
+            {"title": "Golf Balls", "category_path": "Sports & Outdoors > Golf > Golf Balls", "opportunity_score": 90, "data_confidence": "medium", "platform": "Amazon", "marketplace": "US"},
+            {"title": "Women Pants", "category_path": "Clothing, Shoes & Jewelry > Women > Clothing > Pants", "opportunity_score": 86, "data_confidence": "high", "platform": "Amazon", "marketplace": "US"},
+        ]
+
+        reranked, summary = service._rerank_opportunities_with_memory_profile(
+            cards,
+            {
+                "recent_topics": ["women pants"],
+                "risk_preference": "evidence_first",
+                "decision_style": "evidence_first",
+                "preferred_platforms": ["amazon"],
+                "market_focus": ["US"],
+            },
+        )
+
+        self.assertTrue(summary["personalization_applied"])
+        self.assertEqual(reranked[0]["title"], "Women Pants")
+        self.assertEqual(reranked[0]["base_opportunity_score"], 86)
+        self.assertGreater(reranked[0]["personalized_opportunity_score"], reranked[1]["personalized_opportunity_score"])
+        self.assertIn("recent_topic_match:women pants", reranked[0]["memory_profile_rerank"]["reasons"])
+
+    def test_opportunity_discovery_finalizer_adds_job_ref_and_persists_payload(self) -> None:
+        service = ProductThemeService()
+        calls: list[tuple[str, list]] = []
+
+        class FakeConn:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def fake_query(conn, sql, params):
+            calls.append((sql, params))
+            return []
+
+        with patch("data_platform.api.product_theme_api._postgres_conn", return_value=FakeConn()), patch(
+            "data_platform.api.product_theme_api._run_pg_dict_query",
+            side_effect=fake_query,
+        ):
+            result = service._finalize_opportunity_discovery_result(
+                request=OpportunityDiscoveryRequest(limit=1),
+                domain=1,
+                marketplace="US",
+                result={
+                    "marketplace": "US",
+                    "domain": 1,
+                    "platform": "Amazon",
+                    "opportunity_count": 1,
+                    "opportunities": [
+                        {
+                            "opportunity_id": "opp_test",
+                            "title": "Golf Balls",
+                            "category_id": 12345,
+                            "category_path": "Sports & Outdoors > Sports > Golf > Golf Balls",
+                            "opportunity_score": 88.0,
+                            "data_confidence": "high",
+                        }
+                    ],
+                },
+            )
+
+        self.assertTrue(result["opportunity_discovery_job_id"].startswith("odisc_"))
+        self.assertEqual(result["result_ref"]["job_id"], result["opportunity_discovery_job_id"])
+        self.assertIn("opportunity_cards_text", result)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("sync.keepa_opportunity_discovery_jobs", calls[0][0])
+        self.assertEqual(calls[0][1][0], result["opportunity_discovery_job_id"])
 
 
 if __name__ == "__main__":

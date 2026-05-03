@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 import logging
 import os
 from pathlib import Path
@@ -333,6 +334,7 @@ class OpportunityDiscoveryRequest(BaseModel):
     min_data_confidence: str = "low"
     include_expandable: bool = True
     include_descendants: bool = True
+    memory_profile: dict[str, Any] | None = None
 
     @validator("query", "category_path", pre=True, always=True)
     def _normalize_optional_string(cls, v: Any) -> str | None:  # noqa: N805
@@ -355,6 +357,20 @@ class OpportunityDiscoveryRequest(BaseModel):
         if value not in allowed:
             raise ValueError("min_data_confidence must be one of: low, medium, high")
         return value
+
+
+class OpportunityDiscoveryJobStatusRequest(BaseModel):
+    job_id: str | None = None
+    marketplace: str | int = "US"
+    include_result: bool = True
+    limit: int = Field(default=20, ge=1, le=100)
+
+    @validator("job_id", pre=True, always=True)
+    def _normalize_optional_job_id(cls, v: Any) -> str | None:  # noqa: N805
+        if v is None:
+            return None
+        value = str(v).strip()
+        return value or None
 
 
 class WeakForecastRequest(CandidatePoolRequest):
@@ -410,6 +426,93 @@ class KeepaAsinLookupRequest(BaseModel):
         return v
 
 
+class LaunchBudgetCalculatorRequest(BaseModel):
+    marketplace: str | int = "US"
+    product_theme: str | None = None
+    selling_price: float | None = Field(default=None, gt=0)
+    unit_product_cost: float | None = Field(default=None, ge=0)
+    landed_cost_per_unit: float | None = Field(default=None, ge=0)
+    packaging_cost: float | None = Field(default=None, ge=0)
+    inbound_shipping_per_unit: float | None = Field(default=None, ge=0)
+    duty_per_unit: float | None = Field(default=None, ge=0)
+    fba_fee: float | None = Field(default=None, ge=0)
+    referral_fee_rate: float | None = Field(default=None, ge=0, le=0.5)
+    coupon_discount_rate: float | None = Field(default=None, ge=0, le=0.8)
+    return_rate: float | None = Field(default=None, ge=0, le=0.8)
+    fixed_startup_cost: float | None = Field(default=None, ge=0)
+    monthly_fixed_cost: float | None = Field(default=None, ge=0)
+    monthly_ad_budget: float | None = Field(default=None, ge=0)
+    launch_units: int | None = Field(default=None, ge=1, le=100000)
+    launch_months: int | None = Field(default=None, ge=1, le=24)
+
+    @validator("product_theme", pre=True, always=True)
+    def _normalize_optional_string(cls, v: Any) -> str | None:  # noqa: N805
+        if v is None:
+            return None
+        value = str(v).strip()
+        return value or None
+
+
+TOOL_CAPABILITY_CONTRACTS: dict[str, dict[str, Any]] = {
+    "/api/product-theme/opportunity-discovery": {
+        "tool_name": "opportunity_discovery",
+        "capability": "opportunity_discovery",
+        "answers": ["机会发现", "机会排序", "可下钻机会入口"],
+        "fact_boundary": "Use opportunity rows and metric definitions as facts; strategic interpretations are model-authored hypotheses.",
+    },
+    "/api/product-theme/resolve-candidates": {
+        "tool_name": "resolve_candidates",
+        "capability": "candidate_pool_resolution",
+        "answers": ["候选 ASIN 池", "召回依据", "候选池质量"],
+        "fact_boundary": "Candidate identities, category paths, and pool_quality are facts; market conclusions require downstream metric tools.",
+    },
+    "/api/product-theme/candidate-pool-stats": {
+        "tool_name": "candidate_pool_stats",
+        "capability": "candidate_pool_descriptive_stats",
+        "answers": ["销量/价格/评论描述统计", "样本规模"],
+        "fact_boundary": "Returned aggregate metrics are tool facts for the requested ASIN pool and window.",
+    },
+    "/api/product-theme/candidate-pool-trends": {
+        "tool_name": "candidate_pool_trends",
+        "capability": "candidate_pool_trend_diagnostics",
+        "answers": ["趋势覆盖", "搜索趋势", "趋势阶段"],
+        "fact_boundary": "Trend metrics are directional signals unless coverage is high and the window is complete.",
+    },
+    "/api/product-theme/product-forecast-explain": {
+        "tool_name": "product_forecast_explain",
+        "capability": "trained_forecast_explainability",
+        "answers": ["模型预测", "预测驱动因素", "预测覆盖率"],
+        "fact_boundary": "Forecast fields are model outputs, not guaranteed future sales; explainability describes model drivers.",
+    },
+    "/api/product-theme/asin-history-timeseries": {
+        "tool_name": "asin_history_timeseries",
+        "capability": "asin_history_analysis",
+        "answers": ["历史销量", "价格/BSR/评论趋势", "数据覆盖"],
+        "fact_boundary": "Timeseries rows and summaries are facts; growth narratives must respect coverage and missing-history notes.",
+    },
+    "/api/product-theme/category-benchmark": {
+        "tool_name": "category_benchmark",
+        "capability": "category_benchmarking",
+        "answers": ["类目基准", "候选池对比", "本地覆盖"],
+        "fact_boundary": "Benchmark claims are bounded by benchmark_is_precise and local_category_coverage.",
+    },
+    "/api/product-theme/launch-budget-calculator": {
+        "tool_name": "launch_budget_calculator",
+        "capability": "unit_economics_and_launch_budget",
+        "answers": ["启动资金", "单件经济模型", "盈亏平衡", "多场景预算"],
+        "fact_boundary": "Arithmetic outputs are deterministic calculations from explicit assumptions; market feasibility remains a hypothesis.",
+    },
+}
+
+
+CLAIM_STRENGTH_GUIDE = {
+    "tool_fact": "Direct field returned by a tool for the requested entity/window.",
+    "derived_metric": "Deterministic calculation from tool facts or explicit assumptions.",
+    "directional_signal": "Reasonable trend or benchmark reading with limited coverage or sample size.",
+    "hypothesis": "Business interpretation that should be phrased as a possibility, not a confirmed outcome.",
+}
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -426,12 +529,141 @@ def _response_meta(endpoint: str, extra: dict[str, Any] | None = None) -> dict[s
     return meta
 
 
+def _tool_name_from_endpoint(endpoint: str) -> str:
+    return endpoint.rsplit("/", 1)[-1].replace("-", "_")
+
+
+def _coverage_claim_strength(coverage_ratio: float | None) -> str:
+    if coverage_ratio is None:
+        return "directional_signal"
+    if coverage_ratio >= 0.8:
+        return "tool_fact"
+    if coverage_ratio >= 0.5:
+        return "directional_signal"
+    return "hypothesis"
+
+
+def _build_evidence_ledger(endpoint: str, data: dict[str, Any]) -> list[dict[str, Any]]:
+    tool_name = _tool_name_from_endpoint(endpoint)
+    if endpoint == "/api/product-theme/asin-history-timeseries":
+        ledger: list[dict[str, Any]] = []
+        for item in data.get("items") if isinstance(data.get("items"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            summary = item.get("window_summary") if isinstance(item.get("window_summary"), dict) else {}
+            latest = item.get("latest_snapshot") if isinstance(item.get("latest_snapshot"), dict) else {}
+            coverage_ratio = _safe_float(summary.get("coverage_ratio"), -1.0)
+            coverage = coverage_ratio if coverage_ratio >= 0 else None
+            ledger.append(
+                {
+                    "evidence_id": f"asin_history:{item.get('asin') or latest.get('asin') or 'unknown'}:{data.get('window_days')}d",
+                    "entity": {"type": "asin", "asin": item.get("asin") or latest.get("asin")},
+                    "source_tool": tool_name,
+                    "source_labels": ["tool_fact", "derived_metric"],
+                    "coverage": {
+                        "requested_days": data.get("window_days"),
+                        "observed_rows": summary.get("series_row_count"),
+                        "coverage_ratio": coverage,
+                    },
+                    "allowed_claim_strength": _coverage_claim_strength(coverage),
+                    "notes": ["Low coverage should be described as directional, not confirmed growth."],
+                }
+            )
+        return ledger
+
+    if endpoint == "/api/product-theme/product-forecast-explain":
+        explanations = data.get("asin_forecast_explanations") if isinstance(data.get("asin_forecast_explanations"), list) else []
+        total = len(explanations)
+        model_hits = _safe_int(data.get("forecast_model_hit_count"))
+        coverage_ratio = round(model_hits / total, 4) if total else None
+        return [
+            {
+                "evidence_id": f"forecast_explain:{data.get('candidate_pool', {}).get('candidate_pool_id') if isinstance(data.get('candidate_pool'), dict) else 'pool'}",
+                "entity": {"type": "candidate_pool", "candidate_pool": data.get("candidate_pool")},
+                "source_tool": tool_name,
+                "source_labels": ["model_output", "derived_metric"],
+                "coverage": {"model_hit_count": model_hits, "item_count": total, "coverage_ratio": coverage_ratio},
+                "allowed_claim_strength": _coverage_claim_strength(coverage_ratio),
+                "notes": ["Forecast values are model outputs and should not be presented as guaranteed future sales."],
+            }
+        ]
+
+    if endpoint == "/api/product-theme/launch-budget-calculator":
+        return [
+            {
+                "evidence_id": "launch_budget:deterministic_calculation",
+                "entity": {"type": "scenario_set", "product_theme": data.get("product_theme")},
+                "source_tool": tool_name,
+                "source_labels": ["derived_metric", "explicit_assumption", "default_assumption"],
+                "coverage": {"scenario_count": len(data.get("scenarios") or [])},
+                "allowed_claim_strength": "derived_metric",
+                "notes": ["Budget and break-even numbers are arithmetic outputs from assumptions, not market guarantees."],
+            }
+        ]
+
+    if endpoint == "/api/product-theme/opportunity-discovery":
+        return [
+            {
+                "evidence_id": f"opportunity_discovery:{data.get('marketplace') or 'market'}:{data.get('opportunity_count') or 0}",
+                "entity": {"type": "opportunity_list", "marketplace": data.get("marketplace")},
+                "source_tool": tool_name,
+                "source_labels": ["tool_fact", "derived_metric"],
+                "coverage": {"opportunity_count": data.get("opportunity_count")},
+                "allowed_claim_strength": "directional_signal",
+                "notes": ["Opportunity cards are prioritization signals and entry points for further analysis."],
+            }
+        ]
+
+    return [
+        {
+            "evidence_id": f"{tool_name}:response",
+            "entity": {"type": "tool_response"},
+            "source_tool": tool_name,
+            "source_labels": ["tool_fact"],
+            "allowed_claim_strength": "tool_fact",
+        }
+    ]
+
+
+def _with_response_contract(endpoint: str, data: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return data
+    contract = TOOL_CAPABILITY_CONTRACTS.get(
+        endpoint,
+        {
+            "tool_name": _tool_name_from_endpoint(endpoint),
+            "capability": _tool_name_from_endpoint(endpoint),
+            "answers": [],
+            "fact_boundary": "Use returned fields as facts; strategic interpretation remains model-authored.",
+        },
+    )
+    enriched = dict(data)
+    enriched.setdefault(
+        "tool_contract",
+        {
+            "schema_version": "xiamimate_tool_contract_v1",
+            **contract,
+            "usage_policy": "Do not hard-code user workflows. Select tools by capability, inputs, and returned evidence.",
+        },
+    )
+    enriched.setdefault(
+        "evidence_contract",
+        {
+            "schema_version": "xiamimate_evidence_contract_v1",
+            "evidence_ledger": _build_evidence_ledger(endpoint, data),
+            "claim_strength_guide": CLAIM_STRENGTH_GUIDE,
+            "response_policy": "Separate tool facts, deterministic calculations, assumptions, and hypotheses in final answers.",
+        },
+    )
+    return enriched
+
+
 def _success_response(endpoint: str, data: dict[str, Any], message: str) -> dict[str, Any]:
     return {
         "success": True,
         "code": "OK",
         "message": message,
-        "data": data,
+        "data": _with_response_contract(endpoint, data),
         "meta": _response_meta(endpoint),
     }
 
@@ -621,6 +853,27 @@ def _leaf_category_name(category_path: Any, fallback_category: Any = None) -> st
 
 def _fine_category_name(category_path: Any, fallback_category: Any = None) -> str | None:
     return _leaf_category_name(category_path, fallback_category)
+
+
+def _opportunity_title_from_category_path(category_path: Any, fallback_category: Any = None) -> str:
+    parts = _category_path_parts(category_path)
+    fallback = str(fallback_category or "").strip()
+    if not parts:
+        return fallback or "Amazon opportunity"
+
+    leaf = parts[-1]
+    audience_labels = {
+        "women": "Women's",
+        "men": "Men's",
+        "girls": "Girls'",
+        "boys": "Boys'",
+    }
+    for part in parts[:-1]:
+        audience = audience_labels.get(part.strip().lower())
+        if audience and not leaf.lower().startswith(audience.lower()):
+            return f"{audience} {leaf}"
+
+    return leaf or fallback or "Amazon opportunity"
 
 
 def _category_distribution(items: list[dict[str, Any]], field_name: str, limit: int = 12) -> list[dict[str, Any]]:
@@ -1960,7 +2213,7 @@ class ProductThemeService:
                 "label": "窗口销量",
                 "meaning": "当前本地 serving 表 estimated_daily_sales 在窗口期内的合计。",
                 "formula": "sum(estimated_daily_sales) over candidate ASIN daily rows in window_days",
-                "display_guidance": "按销量估算/销售信号展示，不要默认加美元符号；只有金额字段明确为 GMV/销售额时才使用货币格式。",
+                "display_guidance": "按销量估算/销售信号展示；单位是销量数量。只有金额字段明确为 GMV/销售额时才使用货币格式。",
                 "sample_scope_fields": ["candidate_count", "row_count", "window_days"],
             },
             "sales_momentum_pct": {
@@ -2011,7 +2264,7 @@ class ProductThemeService:
                 "row_count": row_count,
                 "window_days": window_days,
                 "value": round(sales_window_sum, 2),
-                "display_guidance": "不要默认加美元符号；这是 estimated_daily_sales 的窗口合计，不是明确 GMV 字段。",
+                "display_guidance": "这是 estimated_daily_sales 的窗口合计，单位是销量数量，不是明确 GMV 字段。",
                 "plain_language": f"该值来自 {candidate_count} 个候选 ASIN 在近 {window_days} 天内的 {row_count} 条日粒度数据。",
             },
             "sales_momentum_pct": {
@@ -2054,7 +2307,7 @@ class ProductThemeService:
                 "window_days": window_days,
                 "value": round(sales_window_sum, 2),
                 "daily_avg": round(sales_window_avg, 2),
-                "display_guidance": "不要默认加美元符号；这是 estimated_daily_sales 的窗口合计，不是明确 GMV 字段。",
+                "display_guidance": "这是 estimated_daily_sales 的窗口合计，单位是销量数量，不是明确 GMV 字段。",
             },
             "trend_momentum_pct": {
                 "formula": "trend_wow from candidate_pool_trends, expressed as percentage points in current response",
@@ -2071,14 +2324,27 @@ class ProductThemeService:
     def _build_opportunity_llm_presentation(self, result: dict[str, Any]) -> dict[str, Any]:
         opportunities = list(result.get("opportunities") or [])
         metric_definitions = result.get("metric_definitions") or self._opportunity_metric_definitions()
+        personalization_applied = any(isinstance(card, dict) and card.get("memory_profile_rerank") for card in opportunities)
         lines = [
-            "## 机会发现结果（按工具实际返回，不要补齐不存在的行）",
+            "## 机会发现结果",
             "",
             f"市场: {result.get('marketplace') or 'US'} | 平台: {result.get('platform') or 'Amazon'} | 实际返回机会数: {len(opportunities)}",
             "",
-            "| 排名 | 机会主题 | 得分 | 类目路径 | 窗口销量估算 | 样本ASIN数 | 日数据行数 | 销量增长 | 趋势增长 | 竞争Offer | 置信度 |",
-            "|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---|",
         ]
+        if personalization_applied:
+            lines.extend(
+                [
+                    "| 排名 | 机会主题 | 机会得分 | 个性化分 | 类目路径 | 窗口销量估算 | 样本ASIN数 | 日数据行数 | 销量增长 | 趋势增长 | 竞争Offer | 置信度 |",
+                    "|---:|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---|",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "| 排名 | 机会主题 | 得分 | 类目路径 | 窗口销量估算 | 样本ASIN数 | 日数据行数 | 销量增长 | 趋势增长 | 竞争Offer | 置信度 |",
+                    "|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---|",
+                ]
+            )
         compact_cards: list[dict[str, Any]] = []
         for index, card in enumerate(opportunities, start=1):
             evidence = card.get("evidence_summary") or {}
@@ -2092,51 +2358,66 @@ class ProductThemeService:
             sales_window_sum = evidence.get("sales_window_sum")
             sales_momentum = evidence.get("sales_momentum_pct")
             trend_momentum = evidence.get("trend_momentum_pct", evidence.get("trend_wow"))
-            lines.append(
-                "| {rank} | {title} | {score:.2f} | {path} | {sales} | {asins} | {rows} | {sales_growth} | {trend_growth} | {offer} | {confidence} |".format(
-                    rank=index,
-                    title=str(card.get("title") or ""),
-                    score=_safe_float(card.get("opportunity_score")),
-                    path=str(card.get("category_path") or "-"),
-                    sales="-" if sales_window_sum is None else f"{_safe_float(sales_window_sum):,.2f}",
-                    asins="-" if candidate_count is None else str(candidate_count),
-                    rows="-" if row_count is None else str(row_count),
-                    sales_growth="-" if sales_momentum is None else f"{_safe_float(sales_momentum):+.2f}%",
-                    trend_growth="-" if trend_momentum is None else f"{_safe_float(trend_momentum):+.2f}%",
-                    offer="-" if offer_value is None else f"{_safe_float(offer_value):.2f}",
-                    confidence=str(card.get("data_confidence") or "-"),
+            row_values = {
+                "rank": index,
+                "title": str(card.get("title") or ""),
+                "score": _safe_float(card.get("opportunity_score")),
+                "personalized_score": _safe_float(card.get("personalized_opportunity_score")),
+                "path": str(card.get("category_path") or "-"),
+                "sales": "-" if sales_window_sum is None else f"{_safe_float(sales_window_sum):,.2f}",
+                "asins": "-" if candidate_count is None else str(candidate_count),
+                "rows": "-" if row_count is None else str(row_count),
+                "sales_growth": "-" if sales_momentum is None else f"{_safe_float(sales_momentum):+.2f}%",
+                "trend_growth": "-" if trend_momentum is None else f"{_safe_float(trend_momentum):+.2f}%",
+                "offer": "-" if offer_value is None else f"{_safe_float(offer_value):.2f}",
+                "confidence": str(card.get("data_confidence") or "-"),
+            }
+            if personalization_applied:
+                lines.append(
+                    "| {rank} | {title} | {score:.2f} | {personalized_score:.2f} | {path} | {sales} | {asins} | {rows} | {sales_growth} | {trend_growth} | {offer} | {confidence} |".format(**row_values)
                 )
-            )
-            compact_cards.append(
-                {
-                    "rank": index,
-                    "title": card.get("title"),
-                    "category_path": card.get("category_path"),
-                    "opportunity_score": card.get("opportunity_score"),
-                    "candidate_count": candidate_count,
-                    "row_count": row_count,
-                    "sales_window_sum": sales_window_sum,
-                    "sales_momentum_pct": sales_momentum,
-                    "trend_momentum_pct": trend_momentum,
-                    "offer_count": offer_value,
-                    "data_confidence": card.get("data_confidence"),
-                    "metric_explanations": card.get("metric_explanations"),
-                }
-            )
+            else:
+                lines.append(
+                    "| {rank} | {title} | {score:.2f} | {path} | {sales} | {asins} | {rows} | {sales_growth} | {trend_growth} | {offer} | {confidence} |".format(**row_values)
+                )
+            compact_card = {
+                "rank": index,
+                "opportunity_id": card.get("opportunity_id"),
+                "title": card.get("title"),
+                "source": card.get("source"),
+                "category_id": card.get("category_id"),
+                "category_path": card.get("category_path"),
+                "candidate_pool_id": card.get("candidate_pool_id"),
+                "opportunity_score": card.get("opportunity_score"),
+                "base_opportunity_score": card.get("base_opportunity_score"),
+                "personalized_opportunity_score": card.get("personalized_opportunity_score"),
+                "memory_profile_rerank": card.get("memory_profile_rerank"),
+                "candidate_count": candidate_count,
+                "row_count": row_count,
+                "sales_window_sum": sales_window_sum,
+                "sales_momentum_pct": sales_momentum,
+                "trend_momentum_pct": trend_momentum,
+                "offer_count": offer_value,
+                "data_confidence": card.get("data_confidence"),
+                "next_action": card.get("next_action"),
+                "metric_explanations": card.get("metric_explanations"),
+            }
+            compact_cards.append({key: value for key, value in compact_card.items() if value is not None})
 
         lines.extend(
             [
                 "",
-                "### 字段解释（回复必须包含）",
+                "### 字段解释",
                 f"- 机会得分: {metric_definitions['opportunity_score']['formula']}。这是 0-100 综合排序分，不代表确定收益。",
-                f"- 窗口销量估算: {metric_definitions['sales_window_sum']['meaning']}；公式: {metric_definitions['sales_window_sum']['formula']}。展示时不要默认加美元符号。",
+                f"- 窗口销量估算: {metric_definitions['sales_window_sum']['meaning']}；公式: {metric_definitions['sales_window_sum']['formula']}；单位是销量数量，不是金额。",
                 "- 多少个商品参与统计: 看表格里的“样本ASIN数”；多少条日数据参与统计: 看“日数据行数”。例如样本ASIN数=12、日数据行数=120，表示 12 个候选 ASIN 在窗口内共 120 条 ASIN-日记录。",
                 f"- 销量增长: {metric_definitions['sales_momentum_pct']['formula']}。",
                 f"- 趋势增长: {metric_definitions['trend_momentum_pct']['formula']}。",
                 f"- 竞争Offer: {metric_definitions['offer_count_avg']['meaning']} {metric_definitions['offer_count_avg']['interpretation']}",
                 f"- 数据置信度: {metric_definitions['data_confidence']['formula']}。",
+                *( ["- 个性化分: 仅在 memory profile 有足够偏好信号时出现；它是在机会得分上加入小幅偏好调整后的排序分，不能替代工具事实。"] if personalization_applied else [] ),
                 "",
-                "展示规则: 只展示工具实际返回的机会，不要补齐到 10 行；不要把窗口销量估算渲染成美元金额。",
+                "展示口径: opportunity_count 表示本次返回的机会数量；窗口销量估算是销量数量，不是金额。",
             ]
         )
         return {
@@ -2157,6 +2438,208 @@ class ProductThemeService:
         result["opportunities_for_llm"] = result["llm_presentation"]["opportunities_for_llm"]
         return result
 
+    def _finalize_opportunity_discovery_result(
+        self,
+        *,
+        request: OpportunityDiscoveryRequest,
+        domain: int,
+        marketplace: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        prepared = self._with_opportunity_llm_presentation(result)
+        return self._attach_opportunity_discovery_job(
+            request=request,
+            domain=domain,
+            marketplace=marketplace,
+            result=prepared,
+        )
+
+    def _opportunity_discovery_json(self, value: Any) -> Any:
+        return psycopg2.extras.Json(value, dumps=lambda obj: json.dumps(obj, ensure_ascii=False, default=str))
+
+    def _opportunity_discovery_job_summary(self, result: dict[str, Any]) -> dict[str, Any]:
+        opportunities = result.get("opportunities") or []
+        compact_opportunities: list[dict[str, Any]] = []
+        for item in opportunities[:30]:
+            if not isinstance(item, dict):
+                continue
+            compact_opportunities.append(
+                {
+                    "opportunity_id": item.get("opportunity_id"),
+                    "title": item.get("title"),
+                    "category_id": item.get("category_id"),
+                    "category_path": item.get("category_path"),
+                    "opportunity_score": item.get("opportunity_score"),
+                    "data_confidence": item.get("data_confidence"),
+                    "next_action": item.get("next_action"),
+                }
+            )
+        return {
+            "opportunity_count": int(result.get("opportunity_count") or len(opportunities)),
+            "opportunities": compact_opportunities,
+            "opportunity_cards_text_preview": str(result.get("opportunity_cards_text") or "")[:6000],
+        }
+
+    def _attach_opportunity_discovery_job(
+        self,
+        *,
+        request: OpportunityDiscoveryRequest,
+        domain: int,
+        marketplace: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        job_id = f"odisc_{uuid.uuid4().hex}"
+        job_ref = {
+            "job_id": job_id,
+            "status": "completed",
+            "marketplace": marketplace,
+            "domain": domain,
+            "result_endpoint": "/api/product-theme/opportunity-discovery-job",
+        }
+        result["opportunity_discovery_job_id"] = job_id
+        result["opportunity_discovery_job"] = job_ref
+        result["result_ref"] = {
+            "type": "opportunity_discovery_job",
+            "job_id": job_id,
+            "status_endpoint": "/api/product-theme/opportunity-discovery-job",
+        }
+
+        request_payload = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+        if isinstance(request_payload.get("memory_profile"), dict):
+            profile_payload = request_payload.get("memory_profile") or {}
+            profile = profile_payload.get("profile") if isinstance(profile_payload.get("profile"), dict) else profile_payload
+            request_payload["memory_profile"] = {
+                "present": True,
+                "summary_version": profile_payload.get("summary_version") or profile.get("summary_version"),
+                "profile_fields_present": sorted(key for key, value in profile.items() if value),
+            }
+        summary_payload = self._opportunity_discovery_job_summary(result)
+        try:
+            with _postgres_conn() as conn:
+                _run_pg_dict_query(
+                    conn,
+                    """
+                    INSERT INTO sync.keepa_opportunity_discovery_jobs (
+                        job_id,
+                        domain,
+                        marketplace,
+                        platform,
+                        query,
+                        category_id,
+                        category_path,
+                        include_descendants,
+                        limit_count,
+                        window_days,
+                        min_data_confidence,
+                        include_expandable,
+                        status,
+                        opportunity_count,
+                        request_payload_json,
+                        result_payload_json,
+                        summary_payload_json,
+                        created_at,
+                        updated_at,
+                        finished_at
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        'completed', %s, %s::JSONB, %s::JSONB, %s::JSONB, NOW(), NOW(), NOW()
+                    )
+                    RETURNING job_id
+                    """,
+                    [
+                        job_id,
+                        domain,
+                        marketplace,
+                        request.platform,
+                        request.query,
+                        request.category_id,
+                        request.category_path,
+                        request.include_descendants,
+                        request.limit,
+                        request.window_days,
+                        request.min_data_confidence,
+                        request.include_expandable,
+                        summary_payload["opportunity_count"],
+                        self._opportunity_discovery_json(request_payload),
+                        self._opportunity_discovery_json(result),
+                        self._opportunity_discovery_json(summary_payload),
+                    ],
+                )
+        except Exception as exc:  # pragma: no cover - defensive; discovery should still return facts if persistence is unavailable
+            diagnostics = result.setdefault("diagnostics", {})
+            diagnostics["opportunity_discovery_job_storage"] = {
+                "status": "failed",
+                "error": str(exc),
+            }
+            result["opportunity_discovery_job"]["status"] = "storage_failed"
+            result["result_ref"]["status"] = "storage_failed"
+        return result
+
+    def _format_opportunity_discovery_job(self, row: dict[str, Any], *, include_result: bool) -> dict[str, Any]:
+        job = {
+            "job_id": row.get("job_id"),
+            "marketplace": row.get("marketplace") or DOMAIN_TO_MARKETPLACE.get(int(row.get("domain") or 1), "US"),
+            "domain": int(row.get("domain") or 1),
+            "platform": row.get("platform"),
+            "query": row.get("query"),
+            "category_id": int(row["category_id"]) if row.get("category_id") is not None else None,
+            "category_path": row.get("category_path"),
+            "include_descendants": bool(row.get("include_descendants")),
+            "limit": int(row.get("limit_count") or 0),
+            "window_days": int(row.get("window_days") or 0),
+            "min_data_confidence": row.get("min_data_confidence"),
+            "include_expandable": bool(row.get("include_expandable")),
+            "status": row.get("status"),
+            "opportunity_count": int(row.get("opportunity_count") or 0),
+            "summary_payload": row.get("summary_payload_json") or {},
+            "created_at": _iso_date_or_none(row.get("created_at")),
+            "updated_at": _iso_date_or_none(row.get("updated_at")),
+            "finished_at": _iso_date_or_none(row.get("finished_at")),
+        }
+        if include_result:
+            job["result_payload"] = row.get("result_payload_json") or {}
+        return job
+
+    def get_opportunity_discovery_job_status(self, request: OpportunityDiscoveryJobStatusRequest) -> dict[str, Any]:
+        domain, marketplace = _normalize_marketplace(request.marketplace)
+        with _postgres_conn() as conn:
+            if request.job_id:
+                rows = _run_pg_dict_query(
+                    conn,
+                    """
+                    SELECT *
+                    FROM sync.keepa_opportunity_discovery_jobs
+                    WHERE job_id = %s
+                    LIMIT 1
+                    """,
+                    [request.job_id],
+                )
+            else:
+                rows = _run_pg_dict_query(
+                    conn,
+                    """
+                    SELECT *
+                    FROM sync.keepa_opportunity_discovery_jobs
+                    WHERE domain = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    [domain, request.limit],
+                )
+
+        return {
+            "marketplace": marketplace,
+            "domain": domain,
+            "job_id": request.job_id,
+            "job_count": len(rows),
+            "jobs": [self._format_opportunity_discovery_job(row, include_result=request.include_result) for row in rows],
+            "notes": [
+                "opportunity discovery jobs preserve full tool evidence so agent context can pass compact references without losing facts",
+                "result_payload.opportunity_cards_text is the canonical user-facing card table for this run",
+            ],
+        }
+
     def _make_opportunity_id(self, *parts: Any) -> str:
         key = ":".join(str(part or "") for part in parts)
         return f"opp_{uuid.uuid5(uuid.NAMESPACE_URL, key).hex[:16]}"
@@ -2171,6 +2654,167 @@ class ProductThemeService:
         min_rank = _confidence_rank(min_data_confidence)
         filtered = [card for card in cards if _confidence_rank(str(card.get("data_confidence") or "low")) >= min_rank]
         return filtered[:limit]
+
+    def _memory_profile_rerank_signals(self, memory_profile: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(memory_profile, dict) or not memory_profile:
+            return {"has_signal": False, "reason": "memory_profile_missing"}
+
+        profile = memory_profile.get("profile") if isinstance(memory_profile.get("profile"), dict) else memory_profile
+        recent_topics = [str(item).strip().lower() for item in profile.get("recent_topics") or [] if str(item).strip()]
+        hard_constraints = [str(item).strip().lower() for item in profile.get("hard_constraints") or [] if str(item).strip()]
+        market_focus = [str(item).strip().upper() for item in profile.get("market_focus") or [] if str(item).strip()]
+        preferred_platforms = [str(item).strip().lower() for item in profile.get("preferred_platforms") or [] if str(item).strip()]
+        risk_preference = str(profile.get("risk_preference") or "").strip().lower()
+        decision_style = str(profile.get("decision_style") or "").strip().lower()
+        preferred_price_band = profile.get("preferred_price_band") if isinstance(profile.get("preferred_price_band"), dict) else {}
+        memory_confidence = profile.get("memory_confidence") if isinstance(profile.get("memory_confidence"), dict) else {}
+
+        enough_signal = bool(
+            recent_topics
+            or hard_constraints
+            or preferred_price_band
+            or risk_preference in {"low", "medium", "high", "conservative", "evidence_first", "risk_averse"}
+            or decision_style in {"evidence_first", "data_first", "fast_scan", "exploratory"}
+        )
+        if not enough_signal:
+            return {
+                "has_signal": False,
+                "reason": "memory_profile_has_no_rerank_signal",
+                "profile_fields_present": sorted(key for key, value in profile.items() if value),
+            }
+
+        return {
+            "has_signal": True,
+            "recent_topics": recent_topics[:12],
+            "hard_constraints": hard_constraints[:12],
+            "market_focus": market_focus[:8],
+            "preferred_platforms": preferred_platforms[:8],
+            "risk_preference": risk_preference,
+            "decision_style": decision_style,
+            "preferred_price_band": preferred_price_band,
+            "memory_confidence": memory_confidence,
+        }
+
+    def _opportunity_memory_profile_adjustment(self, card: dict[str, Any], signals: dict[str, Any]) -> tuple[float, list[str]]:
+        adjustment = 0.0
+        reasons: list[str] = []
+        searchable_text = " ".join(
+            str(value or "").lower()
+            for value in [
+                card.get("title"),
+                card.get("category_name"),
+                card.get("category_path"),
+                (card.get("seller_scope") or {}).get("reason") if isinstance(card.get("seller_scope"), dict) else None,
+            ]
+        )
+        evidence_summary = card.get("evidence_summary") if isinstance(card.get("evidence_summary"), dict) else {}
+        data_confidence = str(card.get("data_confidence") or "low").lower()
+        price_p50 = evidence_summary.get("price_p50")
+
+        for topic in signals.get("recent_topics") or []:
+            topic_tokens = [token for token in re.split(r"[^a-z0-9]+", topic) if len(token) >= 3]
+            if topic and (topic in searchable_text or any(token in searchable_text for token in topic_tokens)):
+                adjustment += 6.0
+                reasons.append(f"recent_topic_match:{topic[:40]}")
+                break
+
+        price_band = signals.get("preferred_price_band") if isinstance(signals.get("preferred_price_band"), dict) else {}
+        price_min = _safe_float(price_band.get("min"), -1.0)
+        price_max = _safe_float(price_band.get("max"), -1.0)
+        if price_p50 is not None and (price_min >= 0 or price_max >= 0):
+            price_value = _safe_float(price_p50)
+            min_ok = price_min < 0 or price_value >= price_min
+            max_ok = price_max < 0 or price_value <= price_max
+            if min_ok and max_ok:
+                adjustment += 4.0
+                reasons.append("preferred_price_band_match")
+            else:
+                adjustment -= 3.0
+                reasons.append("preferred_price_band_mismatch")
+
+        risk_preference = str(signals.get("risk_preference") or "")
+        decision_style = str(signals.get("decision_style") or "")
+        if risk_preference in {"conservative", "risk_averse", "evidence_first"} or decision_style in {"evidence_first", "data_first"}:
+            if data_confidence == "high":
+                adjustment += 4.0
+                reasons.append("evidence_first_high_confidence")
+            elif data_confidence == "low":
+                adjustment -= 4.0
+                reasons.append("evidence_first_low_confidence_penalty")
+
+        if "amazon" in signals.get("preferred_platforms", []) and str(card.get("platform") or "").lower() == "amazon":
+            adjustment += 1.0
+            reasons.append("preferred_platform_match")
+        if str(card.get("marketplace") or "").upper() in signals.get("market_focus", []):
+            adjustment += 1.0
+            reasons.append("market_focus_match")
+
+        for constraint in signals.get("hard_constraints") or []:
+            if constraint and constraint in searchable_text:
+                adjustment -= 8.0
+                reasons.append(f"hard_constraint_text_overlap:{constraint[:40]}")
+                break
+
+        return max(-12.0, min(12.0, adjustment)), reasons[:6]
+
+    def _rerank_opportunities_with_memory_profile(
+        self,
+        cards: list[dict[str, Any]],
+        memory_profile: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        signals = self._memory_profile_rerank_signals(memory_profile)
+        if not signals.get("has_signal"):
+            return cards, {
+                "personalization_applied": False,
+                "reason": signals.get("reason"),
+                "profile_fields_present": signals.get("profile_fields_present", []),
+            }
+
+        reranked: list[dict[str, Any]] = []
+        for original_rank, card in enumerate(cards, start=1):
+            adjustment, reasons = self._opportunity_memory_profile_adjustment(card, signals)
+            updated = dict(card)
+            updated["base_opportunity_score"] = card.get("opportunity_score")
+            updated["personalized_opportunity_score"] = round(_safe_float(card.get("opportunity_score")) + adjustment, 2)
+            updated["memory_profile_rerank"] = {
+                "original_rank": original_rank,
+                "score_adjustment": round(adjustment, 2),
+                "reasons": reasons,
+            }
+            reranked.append(updated)
+
+        reranked.sort(
+            key=lambda item: (
+                _safe_float(item.get("personalized_opportunity_score")),
+                _safe_float(item.get("opportunity_score")),
+            ),
+            reverse=True,
+        )
+        for personalized_rank, card in enumerate(reranked, start=1):
+            card["memory_profile_rerank"]["personalized_rank"] = personalized_rank
+
+        return reranked, {
+            "personalization_applied": True,
+            "rerank_basis": [
+                "recent_topics",
+                "preferred_price_band",
+                "risk_preference",
+                "decision_style",
+                "market_focus",
+                "preferred_platforms",
+                "hard_constraints",
+            ],
+            "max_score_adjustment": 12.0,
+            "profile_signal_counts": {
+                "recent_topics": len(signals.get("recent_topics") or []),
+                "hard_constraints": len(signals.get("hard_constraints") or []),
+                "market_focus": len(signals.get("market_focus") or []),
+                "preferred_platforms": len(signals.get("preferred_platforms") or []),
+                "has_preferred_price_band": bool(signals.get("preferred_price_band")),
+                "has_risk_preference": bool(signals.get("risk_preference")),
+                "has_decision_style": bool(signals.get("decision_style")),
+            },
+        }
 
     def _seller_scope_blocked_response(
         self,
@@ -2199,7 +2843,12 @@ class ProductThemeService:
                 "digital/licensed/copyright media and restricted goods are filtered before opportunity analysis",
             ],
         }
-        return self._with_opportunity_llm_presentation(result)
+        return self._finalize_opportunity_discovery_result(
+            request=request,
+            marketplace=marketplace,
+            domain=domain,
+            result=result,
+        )
 
     def _filter_category_opportunity_rows_by_seller_scope(
         self,
@@ -2482,7 +3131,7 @@ class ProductThemeService:
             row_count=row_count,
         )
         category_path = str(row.get("category_path") or "UNKNOWN")
-        category_name = str(row.get("category_name") or _leaf_category_name(category_path) or category_path)
+        category_name = _opportunity_title_from_category_path(category_path, row.get("category_name"))
         return {
             "opportunity_id": self._make_opportunity_id(marketplace, "category", row.get("category_id"), category_path),
             "title": category_name,
@@ -2490,6 +3139,8 @@ class ProductThemeService:
             "platform": "Amazon",
             "source": "local_category_opportunity_scan",
             "category_id": _safe_int(row.get("category_id")) if row.get("category_id") is not None else None,
+            "category_name": category_name,
+            "raw_category_name": str(row.get("category_name") or "").strip() or None,
             "category_path": category_path,
             "candidate_pool_id": None,
             "seller_scope": row.get("seller_scope") or evaluate_seller_scope(
@@ -2691,7 +3342,7 @@ class ProductThemeService:
                 )
             candidate_asins = _sanitize_asins(resolved.get("candidate_asins", []))
             if not candidate_asins:
-                return self._with_opportunity_llm_presentation({
+                return self._finalize_opportunity_discovery_result(request=request, domain=domain, marketplace=marketplace, result={
                     "marketplace": marketplace,
                     "domain": domain,
                     "platform": request.platform,
@@ -2748,7 +3399,8 @@ class ProductThemeService:
                 min_data_confidence=request.min_data_confidence,
                 limit=request.limit,
             )
-            return self._with_opportunity_llm_presentation({
+            opportunities, personalization_summary = self._rerank_opportunities_with_memory_profile(opportunities, request.memory_profile)
+            return self._finalize_opportunity_discovery_result(request=request, domain=domain, marketplace=marketplace, result={
                 "marketplace": marketplace,
                 "domain": domain,
                 "platform": request.platform,
@@ -2764,6 +3416,7 @@ class ProductThemeService:
                     "recall_mode": resolved.get("recall_mode"),
                     "seller_scope": resolved_scope_decision.as_dict(),
                     "filtered_by_min_data_confidence": len(opportunities) == 0,
+                    "memory_profile_rerank": personalization_summary,
                 },
                 "notes": notes,
             })
@@ -2790,12 +3443,13 @@ class ProductThemeService:
             for row in rows
         ]
         cards.sort(key=lambda item: item["opportunity_score"], reverse=True)
+        cards, personalization_summary = self._rerank_opportunities_with_memory_profile(cards, request.memory_profile)
         opportunities = self._filter_opportunities_by_confidence(
             cards,
             min_data_confidence=request.min_data_confidence,
             limit=request.limit,
         )
-        return self._with_opportunity_llm_presentation({
+        return self._finalize_opportunity_discovery_result(request=request, domain=domain, marketplace=marketplace, result={
             "marketplace": marketplace,
             "domain": domain,
             "platform": request.platform,
@@ -2811,6 +3465,7 @@ class ProductThemeService:
                 "seller_scope": seller_scope_summary,
                 "filtered_by_min_data_confidence": len(opportunities) < min(len(cards), request.limit),
                 "window_days": request.window_days,
+                "memory_profile_rerank": personalization_summary,
             },
             "notes": notes,
         })
@@ -4497,6 +5152,112 @@ class ProductThemeService:
             "notes": forecast_meta.get("notes") if isinstance(forecast_meta.get("notes"), list) else [],
         }
 
+    def get_launch_budget_calculation(self, request: LaunchBudgetCalculatorRequest) -> dict[str, Any]:
+        _domain, marketplace = _normalize_marketplace(request.marketplace)
+
+        def assumption(name: str, value: Any, default: Any) -> dict[str, Any]:
+            explicit = value is not None
+            return {
+                "value": value if explicit else default,
+                "source": "user_input" if explicit else "default_assumption",
+            }
+
+        assumptions = {
+            "selling_price": assumption("selling_price", request.selling_price, 22.99),
+            "unit_product_cost": assumption("unit_product_cost", request.unit_product_cost, 6.0),
+            "landed_cost_per_unit": assumption("landed_cost_per_unit", request.landed_cost_per_unit, None),
+            "packaging_cost": assumption("packaging_cost", request.packaging_cost, 0.5),
+            "inbound_shipping_per_unit": assumption("inbound_shipping_per_unit", request.inbound_shipping_per_unit, 1.5),
+            "duty_per_unit": assumption("duty_per_unit", request.duty_per_unit, 0.3),
+            "fba_fee": assumption("fba_fee", request.fba_fee, 3.5),
+            "referral_fee_rate": assumption("referral_fee_rate", request.referral_fee_rate, 0.15),
+            "coupon_discount_rate": assumption("coupon_discount_rate", request.coupon_discount_rate, 0.10),
+            "return_rate": assumption("return_rate", request.return_rate, 0.08),
+            "fixed_startup_cost": assumption("fixed_startup_cost", request.fixed_startup_cost, 750.0),
+            "monthly_fixed_cost": assumption("monthly_fixed_cost", request.monthly_fixed_cost, 80.0),
+            "monthly_ad_budget": assumption("monthly_ad_budget", request.monthly_ad_budget, 800.0),
+            "launch_units": assumption("launch_units", request.launch_units, 300),
+            "launch_months": assumption("launch_months", request.launch_months, 3),
+        }
+
+        def av(name: str) -> float:
+            return float(assumptions[name]["value"])
+
+        selling_price = av("selling_price")
+        landed_cost_is_explicit = assumptions["landed_cost_per_unit"]["source"] == "user_input"
+        landed_cost_per_unit = av("landed_cost_per_unit") if landed_cost_is_explicit else av("unit_product_cost") + av("packaging_cost") + av("inbound_shipping_per_unit") + av("duty_per_unit")
+        referral_fee_per_unit = selling_price * av("referral_fee_rate")
+        coupon_reserve_per_unit = selling_price * av("coupon_discount_rate")
+        return_reserve_per_unit = selling_price * av("return_rate")
+        contribution_margin_per_unit = selling_price - landed_cost_per_unit - av("fba_fee") - referral_fee_per_unit - coupon_reserve_per_unit - return_reserve_per_unit
+        contribution_margin_rate = contribution_margin_per_unit / selling_price if selling_price else 0.0
+        monthly_operating_cost = av("monthly_fixed_cost") + av("monthly_ad_budget")
+        break_even_units_per_month = monthly_operating_cost / contribution_margin_per_unit if contribution_margin_per_unit > 0 else None
+        break_even_units_per_day = break_even_units_per_month / 30.0 if break_even_units_per_month is not None else None
+
+        scenario_specs = [
+            ("lean", 0.75, 0.75, 0.10),
+            ("standard", 1.0, 1.0, 0.25),
+            ("buffered", 1.25, 1.25, 0.35),
+        ]
+        scenarios: list[dict[str, Any]] = []
+        for name, unit_multiplier, ad_multiplier, buffer_rate in scenario_specs:
+            units = max(1, int(round(av("launch_units") * unit_multiplier)))
+            months = int(round(av("launch_months")))
+            inventory_cash = landed_cost_per_unit * units
+            operating_cash = (av("monthly_fixed_cost") + av("monthly_ad_budget") * ad_multiplier) * months
+            promo_reserve = (coupon_reserve_per_unit + return_reserve_per_unit) * units
+            subtotal = av("fixed_startup_cost") + inventory_cash + operating_cash + promo_reserve
+            buffer = subtotal * buffer_rate
+            scenarios.append(
+                {
+                    "scenario": name,
+                    "launch_units": units,
+                    "launch_months": months,
+                    "inventory_cash": round(inventory_cash, 2),
+                    "operating_cash": round(operating_cash, 2),
+                    "promo_and_return_reserve": round(promo_reserve, 2),
+                    "fixed_startup_cost": round(av("fixed_startup_cost"), 2),
+                    "buffer_rate": buffer_rate,
+                    "buffer_cash": round(buffer, 2),
+                    "startup_cash_required": round(subtotal + buffer, 2),
+                }
+            )
+
+        return {
+            "source_tool": "launch_budget_calculator",
+            "marketplace": marketplace,
+            "product_theme": request.product_theme,
+            "currency": "USD",
+            "assumptions": assumptions,
+            "unit_economics": {
+                "selling_price": round(selling_price, 2),
+                "landed_cost_per_unit": round(landed_cost_per_unit, 2),
+                "landed_cost_source": "user_input" if landed_cost_is_explicit else "component_sum",
+                "referral_fee_per_unit": round(referral_fee_per_unit, 2),
+                "fba_fee_per_unit": round(av("fba_fee"), 2),
+                "coupon_reserve_per_unit": round(coupon_reserve_per_unit, 2),
+                "return_reserve_per_unit": round(return_reserve_per_unit, 2),
+                "contribution_margin_per_unit": round(contribution_margin_per_unit, 2),
+                "contribution_margin_rate": round(contribution_margin_rate, 4),
+            },
+            "break_even": {
+                "monthly_operating_cost": round(monthly_operating_cost, 2),
+                "break_even_units_per_month": round(break_even_units_per_month, 2) if break_even_units_per_month is not None else None,
+                "break_even_units_per_day": round(break_even_units_per_day, 2) if break_even_units_per_day is not None else None,
+                "formula": "(monthly_fixed_cost + monthly_ad_budget) / contribution_margin_per_unit",
+            },
+            "scenarios": scenarios,
+            "assumption_policy": {
+                "user_input": "Value provided by the caller or inherited from prior tool facts.",
+                "default_assumption": "Generic planning default; replace with supplier, ad, fee, or category-specific inputs when available.",
+            },
+            "warnings": [
+                "Use explicit supplier quotes, FBA fee estimates, return rate, and ad budget when available.",
+                "Break-even is a deterministic planning calculation, not a demand forecast.",
+            ],
+        }
+
     def get_asin_history_timeseries(self, request: AsinHistoryTimeseriesRequest) -> dict[str, Any]:
         domain, marketplace = _normalize_marketplace(request.marketplace)
         asins = _sanitize_asins(request.asins)
@@ -5695,6 +6456,15 @@ async def opportunity_discovery(request: OpportunityDiscoveryRequest) -> dict[st
     )
 
 
+@app.post("/api/product-theme/opportunity-discovery-job")
+def opportunity_discovery_job(request: OpportunityDiscoveryJobStatusRequest) -> dict[str, Any]:
+    return _success_response(
+        endpoint="/api/product-theme/opportunity-discovery-job",
+        message="opportunity discovery job result ready",
+        data=service.get_opportunity_discovery_job_status(request),
+    )
+
+
 @app.post("/api/product-theme/candidate-pool-stats")
 def candidate_pool_stats(request: CandidatePoolRequest) -> dict[str, Any]:
     return _success_response(
@@ -5728,6 +6498,15 @@ def product_forecast_explain(request: ProductForecastExplainRequest) -> dict[str
         endpoint="/api/product-theme/product-forecast-explain",
         message="product forecast explanations ready",
         data=service.get_product_forecast_explain(request),
+    )
+
+
+@app.post("/api/product-theme/launch-budget-calculator")
+def launch_budget_calculator(request: LaunchBudgetCalculatorRequest) -> dict[str, Any]:
+    return _success_response(
+        endpoint="/api/product-theme/launch-budget-calculator",
+        message="launch budget calculation ready",
+        data=service.get_launch_budget_calculation(request),
     )
 
 
