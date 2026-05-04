@@ -69,7 +69,7 @@ preview_api() {
     echo "host=$HOST"
     echo "port=$PORT"
     echo "log_file=$LOG_FILE"
-    echo "command=$PYTHON_BIN -m uvicorn $APP_ENTRYPOINT --host $HOST --port $PORT"
+    echo "command=$PYTHON_BIN -m uvicorn $APP_ENTRYPOINT --app-dir $ROOT_DIR --host $HOST --port $PORT"
 }
 
 start_api() {

@@ -50,6 +50,7 @@ class ProductThemeStructureBoundaryTests(unittest.TestCase):
         self.assertIn('APP_ENTRYPOINT="data_platform.api.product_theme.server:app"', source)
         self.assertIn("data_platform.api.product_theme.server:app", source)
         self.assertIn('"$PYTHON_BIN" -m uvicorn "$APP_ENTRYPOINT"', source)
+        self.assertIn('--app-dir "$ROOT_DIR"', source)
         self.assertNotIn("uvicorn data_platform.api.product_theme_api:app", source)
 
     def test_tikhub_code_must_not_land_in_theme_api_entrypoint(self) -> None:
