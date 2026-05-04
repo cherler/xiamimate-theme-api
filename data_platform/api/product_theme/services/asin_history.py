@@ -1,0 +1,1 @@
+"""ASIN history service boundary."""

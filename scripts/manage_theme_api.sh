@@ -12,6 +12,7 @@ PID_FILE="$LOG_DIR/theme_api.pid"
 LOG_FILE="$LOG_DIR/theme_api.log"
 HOST="${THEME_API_HOST:-0.0.0.0}"
 PORT="${THEME_API_PORT:-18100}"
+APP_ENTRYPOINT="data_platform.api.product_theme.server:app"
 
 mkdir -p "$LOG_DIR"
 
@@ -68,7 +69,7 @@ preview_api() {
     echo "host=$HOST"
     echo "port=$PORT"
     echo "log_file=$LOG_FILE"
-    echo "command=$PYTHON_BIN -m uvicorn data_platform.api.product_theme_api:app --host $HOST --port $PORT"
+    echo "command=$PYTHON_BIN -m uvicorn $APP_ENTRYPOINT --host $HOST --port $PORT"
 }
 
 start_api() {
@@ -83,7 +84,7 @@ start_api() {
     fi
 
     cleanup_metadata
-    nohup "$PYTHON_BIN" -m uvicorn data_platform.api.product_theme_api:app \
+    nohup "$PYTHON_BIN" -m uvicorn "$APP_ENTRYPOINT" \
         --app-dir "$ROOT_DIR" \
         --host "$HOST" --port "$PORT" >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
@@ -176,15 +177,15 @@ case "${1:-}" in
     logs)
         show_logs "$@"
         ;;
-        preview)
-                preview_api
-                ;;
+    preview)
+        preview_api
+        ;;
     *)
         cat <<EOF
 Usage: bash scripts/manage_theme_api.sh {start|stop|restart|status|logs|preview}
 
 Commands:
-    start    启动 API 服务（默认 0.0.0.0:18100，供 phase 3 影子验证）
+    start    启动 API 服务（当前解析为 ${HOST}:${PORT}，可用 THEME_API_HOST / THEME_API_PORT 覆盖）
   stop     停止 API 服务
   restart  重启 API 服务（停旧 + 启新，代码更新后用这个）
   status   查看运行状态 + 健康检查

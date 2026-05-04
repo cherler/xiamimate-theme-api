@@ -1,0 +1,1 @@
+"""Candidate pool service boundary."""
