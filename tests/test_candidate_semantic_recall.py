@@ -790,10 +790,12 @@ class CandidateSemanticRecallTests(unittest.TestCase):
         self.assertIn("## 机会发现结果", text)
         self.assertNotIn("按工具实际返回", text)
         self.assertNotIn("不要补齐", text)
-        self.assertIn("| 排名 | 机会主题 | 得分 | 类目路径 | 窗口销量估算 | 样本ASIN数 | 日数据行数 |", text)
+        self.assertIn("| 排名 | 机会 | 得分 | 窗口销量估算 | 增长信号 | 竞争Offer | 样本 | 置信度 |", text)
         self.assertIn("字段解释", text)
-        self.assertIn("样本ASIN数=12", text)
+        self.assertIn("公式明细", text)
+        self.assertIn("ASIN数/日数据行数", text)
         self.assertIn("单位是销量数量，不是金额", text)
+        self.assertEqual(result["opportunities_for_llm"][0]["display_title"], "Golf Balls / Golf")
         self.assertEqual(result["opportunities_for_llm"][0]["candidate_count"], 12)
         self.assertEqual(result["opportunities_for_llm"][0]["row_count"], 120)
         self.assertEqual(result["opportunities_for_llm"][0]["opportunity_id"], card["opportunity_id"])
@@ -802,6 +804,190 @@ class CandidateSemanticRecallTests(unittest.TestCase):
         self.assertEqual(result["opportunities_for_llm"][0]["next_action"]["request"]["category_id"], 12345)
         self.assertEqual(result["opportunities_for_llm"][0]["next_action"]["request"]["category_path"], "Sports & Outdoors > Sports > Golf > Golf Balls")
         self.assertEqual(result["opportunities_for_llm"][0]["next_action"]["request"]["recall_mode"], "category")
+        self.assertIn("formula_details_are_expandable", result["display_rules"])
+        self.assertTrue(any("机会得分" in item for item in result["field_formula_details"]))
+        self.assertTrue(any("工具证据块" in item for item in result["llm_summary_guidance"]))
+        self.assertIn("must_render_opportunity_cards_text_as_evidence_block", result["display_rules"])
+
+    def test_opportunity_discovery_filters_duplicate_titles_for_display(self) -> None:
+        service = ProductThemeService()
+        first_card = service._build_category_opportunity_card(
+            row={
+                "category_id": 111,
+                "category_path": "Appliances > Refrigerators, Freezers & Ice Makers > Ice Makers",
+                "category_name": "Ice Makers",
+                "candidate_count": 12,
+                "row_count": 120,
+                "trend_rows": 60,
+                "sales_window_sum": 3000.0,
+                "sales_mean_7": 12.0,
+                "sales_mean_prev": 10.0,
+                "trend_mean_7": 20.0,
+                "trend_mean_prev": 18.0,
+                "price_p50": 89.0,
+                "review_count_median": 100,
+                "offer_count_avg": 1.6,
+                "max_date": "2026-05-02",
+            },
+            marketplace="US",
+            window_days=30,
+            max_sales_window_sum=3000.0,
+            include_expandable=True,
+        )
+        second_card = service._build_category_opportunity_card(
+            row={
+                "category_id": 222,
+                "category_path": "Appliances > Freezers & Ice Makers > Ice Makers",
+                "category_name": "Ice Makers",
+                "candidate_count": 14,
+                "row_count": 140,
+                "trend_rows": 70,
+                "sales_window_sum": 2400.0,
+                "sales_mean_7": 11.0,
+                "sales_mean_prev": 10.0,
+                "trend_mean_7": 20.0,
+                "trend_mean_prev": 18.0,
+                "price_p50": 92.0,
+                "review_count_median": 120,
+                "offer_count_avg": 1.8,
+                "max_date": "2026-05-02",
+            },
+            marketplace="US",
+            window_days=30,
+            max_sales_window_sum=3000.0,
+            include_expandable=True,
+        )
+
+        opportunities, summary = service._select_opportunities_by_confidence_and_title(
+            [first_card, second_card],
+            min_data_confidence="low",
+            limit=6,
+        )
+
+        self.assertEqual([card["category_id"] for card in opportunities], [111])
+        self.assertEqual(summary["hidden_duplicate_count"], 1)
+        self.assertEqual(summary["hidden_duplicates"][0]["hidden_category_path"], "Appliances > Freezers & Ice Makers > Ice Makers")
+
+        result = service._with_opportunity_llm_presentation(
+            {
+                "marketplace": "US",
+                "platform": "Amazon",
+                "opportunity_count": len(opportunities),
+                "opportunities": opportunities,
+                "metric_definitions": service._opportunity_metric_definitions(),
+                "diagnostics": {"duplicate_title_filter": summary},
+            }
+        )
+
+        self.assertIn("已隐藏 1 个同名主题", result["opportunity_cards_text"])
+        self.assertIn("Ice Makers / Refrigerators, Freezers & Ice Makers", result["opportunity_cards_text"])
+        self.assertIn("must_include_duplicate_title_notice", result["display_rules"])
+
+    def test_category_opportunity_marks_missing_category_id_preflight(self) -> None:
+        service = ProductThemeService()
+        card = service._build_category_opportunity_card(
+            row={
+                "category_id": None,
+                "category_path": "Automotive > Oils & Fluids > Oils > Motor Oils",
+                "category_name": "Motor Oils",
+                "candidate_count": 12,
+                "row_count": 120,
+                "trend_rows": 60,
+                "trend_rows_recent": 10,
+                "trend_rows_prev": 50,
+                "sales_window_sum": 3000.0,
+                "sales_mean_7": 14.0,
+                "sales_mean_prev": 10.0,
+                "trend_mean_7": 12.0,
+                "trend_mean_prev": 10.0,
+                "price_p50": 39.99,
+                "review_count_median": 100,
+                "offer_count_avg": 0.61,
+                "max_date": "2026-05-02",
+            },
+            marketplace="US",
+            window_days=30,
+            max_sales_window_sum=3000.0,
+            include_expandable=True,
+        )
+
+        self.assertIsNone(card["category_id"])
+        self.assertTrue(card["next_action"]["requires_category_resolve"])
+        self.assertEqual(card["next_action"]["preflight_tool"], "category_resolve")
+        self.assertEqual(card["next_action"]["preflight_request"]["category_path"], "Automotive > Oils & Fluids > Oils > Motor Oils")
+
+        result = service._with_opportunity_llm_presentation(
+            {
+                "marketplace": "US",
+                "platform": "Amazon",
+                "opportunity_count": 1,
+                "opportunities": [card],
+                "metric_definitions": service._opportunity_metric_definitions(),
+            }
+        )
+
+        self.assertIn("must_note_category_resolve_required", result["display_rules"])
+        self.assertTrue(any("category_resolve" in item for item in result["llm_summary_guidance"]))
+
+    def test_trend_momentum_display_distinguishes_missing_and_zero(self) -> None:
+        service = ProductThemeService()
+        recent_missing = service._build_category_opportunity_card(
+            row={
+                "category_id": 123,
+                "category_path": "Home & Kitchen > Kitchen & Dining > Ice Makers",
+                "category_name": "Ice Makers",
+                "candidate_count": 12,
+                "row_count": 120,
+                "trend_rows": 50,
+                "trend_rows_recent": 0,
+                "trend_rows_prev": 50,
+                "sales_window_sum": 3000.0,
+                "sales_mean_7": 14.0,
+                "sales_mean_prev": 10.0,
+                "trend_mean_7": None,
+                "trend_mean_prev": 10.0,
+                "price_p50": 39.99,
+                "review_count_median": 100,
+                "offer_count_avg": 0.61,
+                "max_date": "2026-05-02",
+            },
+            marketplace="US",
+            window_days=30,
+            max_sales_window_sum=3000.0,
+            include_expandable=True,
+        )
+        recent_zero = service._build_category_opportunity_card(
+            row={
+                "category_id": 456,
+                "category_path": "Industrial & Scientific > 3D Printing Supplies > 3D Printing Filament",
+                "category_name": "3D Printing Filament",
+                "candidate_count": 12,
+                "row_count": 120,
+                "trend_rows": 60,
+                "trend_rows_recent": 10,
+                "trend_rows_prev": 50,
+                "sales_window_sum": 3000.0,
+                "sales_mean_7": 14.0,
+                "sales_mean_prev": 10.0,
+                "trend_mean_7": 0.0,
+                "trend_mean_prev": 10.0,
+                "price_p50": 39.99,
+                "review_count_median": 100,
+                "offer_count_avg": 0.61,
+                "max_date": "2026-05-02",
+            },
+            marketplace="US",
+            window_days=30,
+            max_sales_window_sum=3000.0,
+            include_expandable=True,
+        )
+
+        self.assertIsNone(recent_missing["evidence_summary"]["trend_momentum_pct"])
+        self.assertEqual(recent_missing["evidence_summary"]["trend_signal_status"], "recent_trend_missing")
+        self.assertEqual(recent_missing["evidence_summary"]["trend_momentum_display"], "近期趋势缺失")
+        self.assertEqual(recent_zero["evidence_summary"]["trend_momentum_pct"], -100.0)
+        self.assertEqual(recent_zero["evidence_summary"]["trend_signal_status"], "recent_trend_zero")
+        self.assertEqual(recent_zero["evidence_summary"]["trend_momentum_display"], "近期趋势为 0")
 
     def test_memory_profile_rerank_keeps_original_order_without_signal(self) -> None:
         service = ProductThemeService()
@@ -840,6 +1026,31 @@ class CandidateSemanticRecallTests(unittest.TestCase):
         self.assertEqual(reranked[0]["base_opportunity_score"], 86)
         self.assertGreater(reranked[0]["personalized_opportunity_score"], reranked[1]["personalized_opportunity_score"])
         self.assertIn("recent_topic_match:women pants", reranked[0]["memory_profile_rerank"]["reasons"])
+
+    def test_memory_profile_rerank_filters_generic_topics_and_guards_low_confidence(self) -> None:
+        service = ProductThemeService()
+
+        signals = service._memory_profile_rerank_signals({"recent_topics": ["us", "amazon", "women pants"]})
+        self.assertEqual(signals["recent_topics"], ["women pants"])
+        self.assertEqual(signals["ignored_recent_topics"], ["us", "amazon"])
+
+        cards = [
+            {"title": "Low Confidence", "category_path": "Sports & Outdoors", "opportunity_score": 56, "data_confidence": "low", "platform": "Amazon", "marketplace": "US"},
+            {"title": "High Confidence", "category_path": "Home & Kitchen", "opportunity_score": 55, "data_confidence": "high", "platform": "Amazon", "marketplace": "US"},
+        ]
+
+        reranked, summary = service._rerank_opportunities_with_memory_profile(
+            cards,
+            {
+                "decision_style": "fast_scan",
+                "preferred_platforms": ["amazon"],
+            },
+        )
+
+        self.assertTrue(summary["personalization_applied"])
+        low_card = next(card for card in reranked if card["title"] == "Low Confidence")
+        self.assertIn("low_confidence_weak_preference_guard", low_card["memory_profile_rerank"]["reasons"])
+        self.assertEqual(low_card["personalized_opportunity_score"], 56.0)
 
     def test_opportunity_discovery_finalizer_adds_job_ref_and_persists_payload(self) -> None:
         service = ProductThemeService()

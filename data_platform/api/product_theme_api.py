@@ -1119,28 +1119,194 @@ class ProductThemeService:
             },
         }
 
+    def _opportunity_title_key(self, card: dict[str, Any]) -> str:
+        title = str(card.get("title") or _leaf_category_name(card.get("category_path")) or "").strip().lower()
+        return re.sub(r"[^a-z0-9]+", " ", title).strip()
+
+    def _trend_momentum_signal(
+        self,
+        *,
+        recent_mean: float,
+        previous_mean: float,
+        recent_rows: int,
+        previous_rows: int,
+        total_rows: int,
+    ) -> dict[str, Any]:
+        if total_rows <= 0 or (recent_rows <= 0 and previous_rows <= 0):
+            return {
+                "value_pct": None,
+                "score_pct": 0.0,
+                "display": "趋势数据缺失",
+                "status": "missing_trend_data",
+                "interpretation": "窗口内没有可用趋势数据，不应解读为趋势下跌。",
+            }
+        if recent_rows <= 0:
+            return {
+                "value_pct": None,
+                "score_pct": 0.0,
+                "display": "近期趋势缺失",
+                "status": "recent_trend_missing",
+                "interpretation": "最近 7 天缺少趋势观测，不应展示为 -100%。",
+            }
+        if previous_rows <= 0 or previous_mean <= 0:
+            return {
+                "value_pct": None,
+                "score_pct": 0.0,
+                "display": "趋势基线不足",
+                "status": "trend_baseline_missing",
+                "interpretation": "窗口前段趋势基线不足，不能计算相对增长率。",
+            }
+
+        value_pct = (recent_mean - previous_mean) / previous_mean * 100.0
+        if recent_mean <= 0:
+            return {
+                "value_pct": round(value_pct, 2),
+                "score_pct": value_pct,
+                "display": "近期趋势为 0",
+                "status": "recent_trend_zero",
+                "interpretation": "最近 7 天有趋势观测但均值为 0；这是近期归零信号，不等同于数据缺失。",
+            }
+        if value_pct <= -95.0:
+            return {
+                "value_pct": round(value_pct, 2),
+                "score_pct": value_pct,
+                "display": f"{value_pct:+.2f}%（大幅下滑）",
+                "status": "sharp_trend_decline",
+                "interpretation": "最近 7 天趋势均值明显低于窗口前段，需要结合趋势覆盖率判断。",
+            }
+        return {
+            "value_pct": round(value_pct, 2),
+            "score_pct": value_pct,
+            "display": f"{value_pct:+.2f}%",
+            "status": "measured_pct",
+            "interpretation": "趋势增长率可按公式解释。",
+        }
+
+    def _select_opportunities_by_confidence_and_title(
+        self,
+        cards: list[dict[str, Any]],
+        *,
+        min_data_confidence: str,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        min_rank = _confidence_rank(min_data_confidence)
+        selected: list[dict[str, Any]] = []
+        selected_by_title: dict[str, dict[str, Any]] = {}
+        hidden_duplicates: list[dict[str, Any]] = []
+        eligible_count = 0
+
+        for card in cards:
+            if _confidence_rank(str(card.get("data_confidence") or "low")) < min_rank:
+                continue
+            eligible_count += 1
+            title_key = self._opportunity_title_key(card)
+            if title_key and title_key in selected_by_title:
+                kept = selected_by_title[title_key]
+                hidden_duplicates.append(
+                    {
+                        "title": card.get("title"),
+                        "kept_opportunity_id": kept.get("opportunity_id"),
+                        "kept_category_path": kept.get("category_path"),
+                        "hidden_opportunity_id": card.get("opportunity_id"),
+                        "hidden_category_path": card.get("category_path"),
+                        "hidden_opportunity_score": card.get("opportunity_score"),
+                    }
+                )
+                continue
+
+            selected.append(card)
+            if title_key:
+                selected_by_title[title_key] = card
+            if len(selected) >= limit:
+                break
+
+        return selected, {
+            "mode": "normalized_title_first_card_wins",
+            "input_count": len(cards),
+            "eligible_count": eligible_count,
+            "kept_count": len(selected),
+            "hidden_duplicate_count": len(hidden_duplicates),
+            "hidden_duplicates": hidden_duplicates[:12],
+        }
+
+    def _opportunity_display_title(self, card: dict[str, Any]) -> str:
+        title = str(card.get("title") or "").strip()
+        category_path = str(card.get("category_path") or "").strip()
+        category_parts = [part.strip() for part in category_path.split(" > ") if part.strip()]
+        parent = category_parts[-2] if len(category_parts) >= 2 else None
+        if title and parent and parent.lower() != title.lower():
+            return f"{title} / {parent}"
+        return title or _leaf_category_name(category_path) or "Amazon opportunity"
+
+    def _opportunity_formula_details(self, metric_definitions: dict[str, Any], personalization_applied: bool) -> list[str]:
+        details = [
+            f"- 机会得分: {metric_definitions['opportunity_score']['formula']}。",
+            f"- 窗口销量估算: {metric_definitions['sales_window_sum']['formula']}。",
+            f"- 销量增长: {metric_definitions['sales_momentum_pct']['formula']}。",
+            f"- 趋势增长: {metric_definitions['trend_momentum_pct']['formula']}；若近期趋势缺失、基线不足或近期均值为 0，会用文字状态展示，避免把缺失误读为 -100%。",
+            f"- 竞争Offer: {metric_definitions['offer_count_avg']['formula']}。",
+            f"- 数据置信度: {metric_definitions['data_confidence']['formula']}。",
+        ]
+        if personalization_applied:
+            details.append("- 个性化分: 在机会得分上加入小幅偏好调整后的排序分，仅用于重排参考。")
+        return details
+
+    def _opportunity_llm_summary_guidance(
+        self,
+        *,
+        duplicate_summary: dict[str, Any],
+        personalization_applied: bool,
+        opportunities: list[dict[str, Any]],
+    ) -> list[str]:
+        guidance = [
+            "最终答复应把 opportunity_cards_text 中的总览表、字段解释和公式明细作为工具证据块展示；可在证据块前后用自己的语言做摘要和解读，但不要改写成平铺列表，不要丢列、改数值或补未返回的数值。",
+            "展示趋势时优先使用 trend_momentum_display / trend_signal_status；不要把趋势缺失或近期为 0 简化成普通 -100%。",
+        ]
+        if _safe_int(duplicate_summary.get("hidden_duplicate_count")) > 0:
+            guidance.append("必须明确提示 duplicate_title_filter.hidden_duplicate_count，说明同名主题已隐藏低优先级类目。")
+        if personalization_applied:
+            guidance.append("如果按个性化排序展示，表格必须保留个性化分；若另行排序，需要说明排序口径。")
+        if any(isinstance(card, dict) and (card.get("next_action") or {}).get("requires_category_resolve") for card in opportunities):
+            guidance.append("category_id 为空且 next_action.requires_category_resolve=true 的机会，必须提示先调用 category_resolve 再做类目召回分析。")
+        return guidance
+
     def _build_opportunity_llm_presentation(self, result: dict[str, Any]) -> dict[str, Any]:
         opportunities = list(result.get("opportunities") or [])
         metric_definitions = result.get("metric_definitions") or self._opportunity_metric_definitions()
         personalization_applied = any(isinstance(card, dict) and card.get("memory_profile_rerank") for card in opportunities)
+        formula_details = self._opportunity_formula_details(metric_definitions, personalization_applied)
         lines = [
             "## 机会发现结果",
             "",
             f"市场: {result.get('marketplace') or 'US'} | 平台: {result.get('platform') or 'Amazon'} | 实际返回机会数: {len(opportunities)}",
             "",
         ]
+        duplicate_summary = ((result.get("diagnostics") or {}).get("duplicate_title_filter") or {})
+        llm_summary_guidance = self._opportunity_llm_summary_guidance(
+            duplicate_summary=duplicate_summary,
+            personalization_applied=personalization_applied,
+            opportunities=opportunities,
+        )
+        hidden_duplicate_count = _safe_int(duplicate_summary.get("hidden_duplicate_count"))
+        if hidden_duplicate_count > 0:
+            lines.extend(
+                [
+                    f"已隐藏 {hidden_duplicate_count} 个同名主题的低优先级类目，榜单默认保留每个主题当前最高排序机会。",
+                    "",
+                ]
+            )
         if personalization_applied:
             lines.extend(
                 [
-                    "| 排名 | 机会主题 | 机会得分 | 个性化分 | 类目路径 | 窗口销量估算 | 样本ASIN数 | 日数据行数 | 销量增长 | 趋势增长 | 竞争Offer | 置信度 |",
-                    "|---:|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---|",
+                    "| 排名 | 机会 | 机会得分 | 个性化分 | 窗口销量估算 | 增长信号 | 竞争Offer | 样本 | 置信度 |",
+                    "|---:|---|---:|---:|---:|---|---:|---:|---|",
                 ]
             )
         else:
             lines.extend(
                 [
-                    "| 排名 | 机会主题 | 得分 | 类目路径 | 窗口销量估算 | 样本ASIN数 | 日数据行数 | 销量增长 | 趋势增长 | 竞争Offer | 置信度 |",
-                    "|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---|",
+                    "| 排名 | 机会 | 得分 | 窗口销量估算 | 增长信号 | 竞争Offer | 样本 | 置信度 |",
+                    "|---:|---|---:|---:|---|---:|---:|---|",
                 ]
             )
         compact_cards: list[dict[str, Any]] = []
@@ -1156,32 +1322,38 @@ class ProductThemeService:
             sales_window_sum = evidence.get("sales_window_sum")
             sales_momentum = evidence.get("sales_momentum_pct")
             trend_momentum = evidence.get("trend_momentum_pct", evidence.get("trend_wow"))
+            trend_display = evidence.get("trend_momentum_display")
+            display_title = self._opportunity_display_title(card)
+            growth_signal = "销量 {sales} / 趋势 {trend}".format(
+                sales="-" if sales_momentum is None else f"{_safe_float(sales_momentum):+.2f}%",
+                trend=str(trend_display) if trend_display else ("-" if trend_momentum is None else f"{_safe_float(trend_momentum):+.2f}%"),
+            )
             row_values = {
                 "rank": index,
-                "title": str(card.get("title") or ""),
+                "title": display_title,
                 "score": _safe_float(card.get("opportunity_score")),
                 "personalized_score": _safe_float(card.get("personalized_opportunity_score")),
                 "path": str(card.get("category_path") or "-"),
                 "sales": "-" if sales_window_sum is None else f"{_safe_float(sales_window_sum):,.2f}",
                 "asins": "-" if candidate_count is None else str(candidate_count),
                 "rows": "-" if row_count is None else str(row_count),
-                "sales_growth": "-" if sales_momentum is None else f"{_safe_float(sales_momentum):+.2f}%",
-                "trend_growth": "-" if trend_momentum is None else f"{_safe_float(trend_momentum):+.2f}%",
+                "growth_signal": growth_signal,
                 "offer": "-" if offer_value is None else f"{_safe_float(offer_value):.2f}",
                 "confidence": str(card.get("data_confidence") or "-"),
             }
             if personalization_applied:
                 lines.append(
-                    "| {rank} | {title} | {score:.2f} | {personalized_score:.2f} | {path} | {sales} | {asins} | {rows} | {sales_growth} | {trend_growth} | {offer} | {confidence} |".format(**row_values)
+                    "| {rank} | {title} | {score:.2f} | {personalized_score:.2f} | {sales} | {growth_signal} | {offer} | {asins}/{rows} | {confidence} |".format(**row_values)
                 )
             else:
                 lines.append(
-                    "| {rank} | {title} | {score:.2f} | {path} | {sales} | {asins} | {rows} | {sales_growth} | {trend_growth} | {offer} | {confidence} |".format(**row_values)
+                    "| {rank} | {title} | {score:.2f} | {sales} | {growth_signal} | {offer} | {asins}/{rows} | {confidence} |".format(**row_values)
                 )
             compact_card = {
                 "rank": index,
                 "opportunity_id": card.get("opportunity_id"),
                 "title": card.get("title"),
+                "display_title": display_title,
                 "source": card.get("source"),
                 "category_id": card.get("category_id"),
                 "category_path": card.get("category_path"),
@@ -1195,6 +1367,8 @@ class ProductThemeService:
                 "sales_window_sum": sales_window_sum,
                 "sales_momentum_pct": sales_momentum,
                 "trend_momentum_pct": trend_momentum,
+                "trend_momentum_display": trend_display,
+                "trend_signal_status": evidence.get("trend_signal_status"),
                 "offer_count": offer_value,
                 "data_confidence": card.get("data_confidence"),
                 "next_action": card.get("next_action"),
@@ -1206,24 +1380,35 @@ class ProductThemeService:
             [
                 "",
                 "### 字段解释",
-                f"- 机会得分: {metric_definitions['opportunity_score']['formula']}。这是 0-100 综合排序分，不代表确定收益。",
-                f"- 窗口销量估算: {metric_definitions['sales_window_sum']['meaning']}；公式: {metric_definitions['sales_window_sum']['formula']}；单位是销量数量，不是金额。",
-                "- 多少个商品参与统计: 看表格里的“样本ASIN数”；多少条日数据参与统计: 看“日数据行数”。例如样本ASIN数=12、日数据行数=120，表示 12 个候选 ASIN 在窗口内共 120 条 ASIN-日记录。",
-                f"- 销量增长: {metric_definitions['sales_momentum_pct']['formula']}。",
-                f"- 趋势增长: {metric_definitions['trend_momentum_pct']['formula']}。",
-                f"- 竞争Offer: {metric_definitions['offer_count_avg']['meaning']} {metric_definitions['offer_count_avg']['interpretation']}",
-                f"- 数据置信度: {metric_definitions['data_confidence']['formula']}。",
-                *( ["- 个性化分: 仅在 memory profile 有足够偏好信号时出现；它是在机会得分上加入小幅偏好调整后的排序分，不能替代工具事实。"] if personalization_applied else [] ),
+                "- 机会得分: 0-100 排序分，越高越值得优先分析，不代表确定收益。",
+                "- 窗口销量估算: estimated_daily_sales 的窗口合计，单位是销量数量，不是金额。",
+                "- 样本: 写作 ASIN数/日数据行数，用来判断这条机会的证据厚度。",
+                "- 增长与竞争: 销量/趋势为近 7 天相对前段变化；竞争Offer是同一 ASIN 的可购买报价均值。",
+                *( ["- 个性化分: 只用于结合偏好重排，不能替代工具事实。"] if personalization_applied else [] ),
                 "",
-                "展示口径: opportunity_count 表示本次返回的机会数量；窗口销量估算是销量数量，不是金额。",
+                "<details>",
+                "<summary>公式明细</summary>",
+                "",
+                *formula_details,
+                "",
+                "</details>",
             ]
         )
         return {
             "opportunity_cards_text": "\n".join(lines),
             "opportunities_for_llm": compact_cards,
+            "field_formula_details": formula_details,
+            "llm_summary_guidance": llm_summary_guidance,
             "display_rules": [
                 "must_include_metric_table",
-                "must_include_field_explanations",
+                "must_render_opportunity_cards_text_as_evidence_block",
+                "must_include_short_field_explanations",
+                "formula_details_are_expandable",
+                "preserve_llm_summary_guidance",
+                *( ["must_include_duplicate_title_notice"] if hidden_duplicate_count > 0 else [] ),
+                *( ["must_include_personalized_score"] if personalization_applied else [] ),
+                *( ["must_note_category_resolve_required"] if any((card.get("next_action") or {}).get("requires_category_resolve") for card in opportunities if isinstance(card, dict)) else [] ),
+                "use_trend_momentum_display",
                 "do_not_pad_missing_opportunities",
                 "do_not_format_estimated_daily_sales_as_currency",
             ],
@@ -1234,6 +1419,9 @@ class ProductThemeService:
         result["llm_presentation"] = self._build_opportunity_llm_presentation(result)
         result["opportunity_cards_text"] = result["llm_presentation"]["opportunity_cards_text"]
         result["opportunities_for_llm"] = result["llm_presentation"]["opportunities_for_llm"]
+        result["field_formula_details"] = result["llm_presentation"]["field_formula_details"]
+        result["llm_summary_guidance"] = result["llm_presentation"]["llm_summary_guidance"]
+        result["display_rules"] = result["llm_presentation"]["display_rules"]
         return result
 
     def _finalize_opportunity_discovery_result(
@@ -1434,7 +1622,7 @@ class ProductThemeService:
             "jobs": [self._format_opportunity_discovery_job(row, include_result=request.include_result) for row in rows],
             "notes": [
                 "opportunity discovery jobs preserve full tool evidence so agent context can pass compact references without losing facts",
-                "result_payload.opportunity_cards_text is the canonical user-facing card table for this run",
+                "result_payload.opportunity_cards_text is the canonical evidence block for this run",
             ],
         }
 
@@ -1458,7 +1646,25 @@ class ProductThemeService:
             return {"has_signal": False, "reason": "memory_profile_missing"}
 
         profile = memory_profile.get("profile") if isinstance(memory_profile.get("profile"), dict) else memory_profile
-        recent_topics = [str(item).strip().lower() for item in profile.get("recent_topics") or [] if str(item).strip()]
+        generic_topics = {
+            "us",
+            "usa",
+            "u s",
+            "amazon",
+            "market",
+            "marketplace",
+            "seller",
+            "sellers",
+            "product",
+            "products",
+            "shopping",
+            "ecommerce",
+            "e commerce",
+            "cross border",
+        }
+        raw_recent_topics = [str(item).strip().lower() for item in profile.get("recent_topics") or [] if str(item).strip()]
+        recent_topics = [topic for topic in raw_recent_topics if topic not in generic_topics]
+        ignored_recent_topics = [topic for topic in raw_recent_topics if topic in generic_topics]
         hard_constraints = [str(item).strip().lower() for item in profile.get("hard_constraints") or [] if str(item).strip()]
         market_focus = [str(item).strip().upper() for item in profile.get("market_focus") or [] if str(item).strip()]
         preferred_platforms = [str(item).strip().lower() for item in profile.get("preferred_platforms") or [] if str(item).strip()]
@@ -1484,6 +1690,7 @@ class ProductThemeService:
         return {
             "has_signal": True,
             "recent_topics": recent_topics[:12],
+            "ignored_recent_topics": ignored_recent_topics[:12],
             "hard_constraints": hard_constraints[:12],
             "market_focus": market_focus[:8],
             "preferred_platforms": preferred_platforms[:8],
@@ -1492,6 +1699,20 @@ class ProductThemeService:
             "preferred_price_band": preferred_price_band,
             "memory_confidence": memory_confidence,
         }
+
+    def _memory_topic_match(self, topic: str, searchable_text: str) -> tuple[bool, bool]:
+        topic_tokens = [token for token in re.split(r"[^a-z0-9]+", topic.lower()) if len(token) >= 3]
+        topic_tokens = [token for token in topic_tokens if token not in {"the", "and", "for", "with", "market", "amazon", "usa"}]
+        if not topic_tokens:
+            return False, False
+
+        searchable_tokens = set(token for token in re.split(r"[^a-z0-9]+", searchable_text.lower()) if token)
+        if len(topic_tokens) >= 2:
+            return all(token in searchable_tokens for token in topic_tokens), True
+        token = topic_tokens[0]
+        if len(token) < 4:
+            return False, False
+        return token in searchable_tokens, False
 
     def _opportunity_memory_profile_adjustment(self, card: dict[str, Any], signals: dict[str, Any]) -> tuple[float, list[str]]:
         adjustment = 0.0
@@ -1508,12 +1729,15 @@ class ProductThemeService:
         evidence_summary = card.get("evidence_summary") if isinstance(card.get("evidence_summary"), dict) else {}
         data_confidence = str(card.get("data_confidence") or "low").lower()
         price_p50 = evidence_summary.get("price_p50")
+        has_strong_positive_signal = False
 
         for topic in signals.get("recent_topics") or []:
-            topic_tokens = [token for token in re.split(r"[^a-z0-9]+", topic) if len(token) >= 3]
-            if topic and (topic in searchable_text or any(token in searchable_text for token in topic_tokens)):
+            matches_topic, strong_topic = self._memory_topic_match(topic, searchable_text)
+            if topic and matches_topic:
                 adjustment += 6.0
                 reasons.append(f"recent_topic_match:{topic[:40]}")
+                if strong_topic:
+                    has_strong_positive_signal = True
                 break
 
         price_band = signals.get("preferred_price_band") if isinstance(signals.get("preferred_price_band"), dict) else {}
@@ -1526,6 +1750,7 @@ class ProductThemeService:
             if min_ok and max_ok:
                 adjustment += 4.0
                 reasons.append("preferred_price_band_match")
+                has_strong_positive_signal = True
             else:
                 adjustment -= 3.0
                 reasons.append("preferred_price_band_mismatch")
@@ -1552,6 +1777,10 @@ class ProductThemeService:
                 adjustment -= 8.0
                 reasons.append(f"hard_constraint_text_overlap:{constraint[:40]}")
                 break
+
+        if data_confidence == "low" and adjustment > 0 and not has_strong_positive_signal:
+            adjustment = 0.0
+            reasons.append("low_confidence_weak_preference_guard")
 
         return max(-12.0, min(12.0, adjustment)), reasons[:6]
 
@@ -1605,6 +1834,7 @@ class ProductThemeService:
             "max_score_adjustment": 12.0,
             "profile_signal_counts": {
                 "recent_topics": len(signals.get("recent_topics") or []),
+                "ignored_recent_topics": len(signals.get("ignored_recent_topics") or []),
                 "hard_constraints": len(signals.get("hard_constraints") or []),
                 "market_focus": len(signals.get("market_focus") or []),
                 "preferred_platforms": len(signals.get("preferred_platforms") or []),
@@ -1855,6 +2085,8 @@ class ProductThemeService:
                     AVG(f.trend_index_mean) FILTER (WHERE f.date >= (SELECT max_date - INTERVAL '6 day' FROM max_date)) AS trend_mean_7,
                     AVG(f.trend_index_mean) FILTER (WHERE f.date < (SELECT max_date - INTERVAL '6 day' FROM max_date)) AS trend_mean_prev,
                     COUNT(*) FILTER (WHERE f.trend_index_mean IS NOT NULL) AS trend_rows,
+                    COUNT(*) FILTER (WHERE f.trend_index_mean IS NOT NULL AND f.date >= (SELECT max_date - INTERVAL '6 day' FROM max_date)) AS trend_rows_recent,
+                    COUNT(*) FILTER (WHERE f.trend_index_mean IS NOT NULL AND f.date < (SELECT max_date - INTERVAL '6 day' FROM max_date)) AS trend_rows_prev,
                     PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY f.effective_price) AS price_p50,
                     PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY f.review_count) AS review_count_median,
                     AVG(f.offer_count) AS offer_count_avg,
@@ -1898,6 +2130,8 @@ class ProductThemeService:
         candidate_count = _safe_int(row.get("candidate_count"))
         row_count = _safe_int(row.get("row_count"))
         trend_rows = _safe_int(row.get("trend_rows"))
+        trend_rows_recent = _safe_int(row.get("trend_rows_recent"))
+        trend_rows_prev = _safe_int(row.get("trend_rows_prev"))
         trend_coverage = round(trend_rows / row_count, 4) if row_count else 0.0
         sales_window_sum = _safe_float(row.get("sales_window_sum"))
         sales_mean_7 = _safe_float(row.get("sales_mean_7"))
@@ -1905,7 +2139,18 @@ class ProductThemeService:
         trend_mean_7 = _safe_float(row.get("trend_mean_7"))
         trend_mean_prev = _safe_float(row.get("trend_mean_prev"))
         sales_momentum_pct = ((sales_mean_7 - sales_mean_prev) / sales_mean_prev * 100.0) if sales_mean_prev > 0 else 0.0
-        trend_momentum_pct = ((trend_mean_7 - trend_mean_prev) / trend_mean_prev * 100.0) if trend_mean_prev > 0 else 0.0
+        if trend_rows > 0 and trend_rows_recent <= 0 and row.get("trend_mean_7") is not None:
+            trend_rows_recent = trend_rows
+        if trend_rows > 0 and trend_rows_prev <= 0 and row.get("trend_mean_prev") is not None:
+            trend_rows_prev = trend_rows
+        trend_signal = self._trend_momentum_signal(
+            recent_mean=trend_mean_7,
+            previous_mean=trend_mean_prev,
+            recent_rows=trend_rows_recent,
+            previous_rows=trend_rows_prev,
+            total_rows=trend_rows,
+        )
+        trend_momentum_pct = trend_signal.get("score_pct")
         offer_count_avg = _safe_float(row.get("offer_count_avg"))
         review_count_median = _safe_float(row.get("review_count_median"))
         price_p50 = row.get("price_p50")
@@ -1930,13 +2175,34 @@ class ProductThemeService:
         )
         category_path = str(row.get("category_path") or "UNKNOWN")
         category_name = _opportunity_title_from_category_path(category_path, row.get("category_name"))
+        category_id_value = _safe_int(row.get("category_id")) if row.get("category_id") is not None else None
+        next_action = {
+            "type": "analyze_theme",
+            "label": "进入商品主题分析" if category_id_value is not None else "先解析类目后进入商品主题分析",
+            "requires_category_resolve": category_id_value is None,
+            "request": {
+                "product_query": category_name,
+                "marketplace": marketplace,
+                "category_id": category_id_value,
+                "category_path": category_path,
+                "recall_mode": "category",
+                "include_descendants": True,
+            },
+        }
+        if category_id_value is None:
+            next_action["preflight_tool"] = "category_resolve"
+            next_action["preflight_request"] = {
+                "category_path": category_path,
+                "marketplace": marketplace,
+            }
+            next_action["readiness_note"] = "category_id is missing; call category_resolve before category recall for a stable execution key."
         return {
             "opportunity_id": self._make_opportunity_id(marketplace, "category", row.get("category_id"), category_path),
             "title": category_name,
             "marketplace": marketplace,
             "platform": "Amazon",
             "source": "local_category_opportunity_scan",
-            "category_id": _safe_int(row.get("category_id")) if row.get("category_id") is not None else None,
+            "category_id": category_id_value,
             "category_name": category_name,
             "raw_category_name": str(row.get("category_name") or "").strip() or None,
             "category_path": category_path,
@@ -1953,8 +2219,13 @@ class ProductThemeService:
                 "row_count": row_count,
                 "sales_window_sum": round(sales_window_sum, 2),
                 "sales_momentum_pct": round(sales_momentum_pct, 2),
-                "trend_momentum_pct": round(trend_momentum_pct, 2),
+                "trend_momentum_pct": trend_signal.get("value_pct"),
+                "trend_momentum_display": trend_signal.get("display"),
+                "trend_signal_status": trend_signal.get("status"),
+                "trend_signal_interpretation": trend_signal.get("interpretation"),
                 "trend_coverage": trend_coverage,
+                "trend_rows_recent": trend_rows_recent,
+                "trend_rows_previous": trend_rows_prev,
                 "price_p50": round(_safe_float(price_p50), 2) if price_p50 is not None else None,
                 "offer_count_avg": round(offer_count_avg, 2),
                 "review_count_median": round(review_count_median, 2),
@@ -1976,18 +2247,7 @@ class ProductThemeService:
                 trend_coverage=trend_coverage,
             ),
             "data_confidence": data_confidence,
-            "next_action": {
-                "type": "analyze_theme",
-                "label": "进入商品主题分析",
-                "request": {
-                    "product_query": category_name,
-                    "marketplace": marketplace,
-                    "category_id": _safe_int(row.get("category_id")) if row.get("category_id") is not None else None,
-                    "category_path": category_path,
-                    "recall_mode": "category",
-                    "include_descendants": True,
-                },
-            },
+            "next_action": next_action,
         }
 
     def _build_query_opportunity_card(
@@ -2242,7 +2502,7 @@ class ProductThemeService:
         ]
         cards.sort(key=lambda item: item["opportunity_score"], reverse=True)
         cards, personalization_summary = self._rerank_opportunities_with_memory_profile(cards, request.memory_profile)
-        opportunities = self._filter_opportunities_by_confidence(
+        opportunities, duplicate_title_summary = self._select_opportunities_by_confidence_and_title(
             cards,
             min_data_confidence=request.min_data_confidence,
             limit=request.limit,
@@ -2261,7 +2521,8 @@ class ProductThemeService:
                 "scanned_category_count": seller_scope_summary["input_count"],
                 "unclassified_category_filter": unclassified_summary,
                 "seller_scope": seller_scope_summary,
-                "filtered_by_min_data_confidence": len(opportunities) < min(len(cards), request.limit),
+                "filtered_by_min_data_confidence": duplicate_title_summary["eligible_count"] < min(len(cards), request.limit),
+                "duplicate_title_filter": duplicate_title_summary,
                 "window_days": request.window_days,
                 "memory_profile_rerank": personalization_summary,
             },
