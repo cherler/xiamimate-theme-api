@@ -27,6 +27,9 @@ class ResolveCandidatesRequest(BaseModel):
     price_max: Optional[float] = None
     max_candidates: int = Field(default=50, ge=1, le=500)
     active_only: bool = True
+    response_profile: str = "standard"
+    include_debug: bool = False
+    include_response_contract: bool = True
 
     @validator("query_aliases", "category_hints", pre=True, always=True)
     def _accept_csv_string(cls, v: Any) -> list[str]:  # noqa: N805
@@ -42,6 +45,14 @@ class ResolveCandidatesRequest(BaseModel):
         allowed = {"keyword", "category", "hybrid", "asin_seed_expand"}
         if value not in allowed:
             raise ValueError("recall_mode must be one of: keyword, category, hybrid, asin_seed_expand")
+        return value
+
+    @validator("response_profile")
+    def _validate_response_profile(cls, v: str) -> str:  # noqa: N805
+        value = (v or "standard").strip().lower()
+        allowed = {"standard", "compact", "debug"}
+        if value not in allowed:
+            raise ValueError("response_profile must be one of: standard, compact, debug")
         return value
 
     @validator("category_path", pre=True, always=True)

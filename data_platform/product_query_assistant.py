@@ -167,11 +167,70 @@ def _should_skip_llm_for_simple_query(
     query_aliases: list[str] | None = None,
     category_hints: list[str] | None = None,
 ) -> bool:
+    should_skip, _mode = _should_skip_llm_for_catalog_query(
+        env_prefix,
+        product_query,
+        query_aliases,
+        category_hints,
+    )
+    return should_skip
+
+
+def _looks_like_prepared_catalog_query(
+    product_query: str,
+    query_aliases: list[str] | None = None,
+    category_hints: list[str] | None = None,
+) -> bool:
+    text = _trim_phrase(product_query, max_length=240)
+    aliases = _sanitize_phrase_list(list(query_aliases or []), max_items=8)
+    hints = _sanitize_phrase_list(list(category_hints or []), max_items=8)
+    combined = [text, *aliases, *hints]
+
+    if not text or len(text) > 80:
+        return False
+    if len(aliases) > 8 or len(hints) > 8:
+        return False
+    if any(len(item) > 120 for item in combined if item):
+        return False
+    if any(re.search(r"[?？。；;!！\n\r]", item) for item in combined if item):
+        return False
+
+    product_tokens = re.findall(r"[a-z0-9]+", text.lower())
+    if not 1 <= len(product_tokens) <= 6:
+        return False
+
+    intent_words = {
+        "analyze",
+        "analysis",
+        "compare",
+        "competitor",
+        "competitors",
+        "find",
+        "report",
+        "research",
+        "select",
+        "trend",
+        "trends",
+    }
+    tokens = re.findall(r"[a-z0-9]+", " ".join(combined).lower())
+    return not any(token in intent_words for token in tokens)
+
+
+def _should_skip_llm_for_catalog_query(
+    env_prefix: str,
+    product_query: str,
+    query_aliases: list[str] | None = None,
+    category_hints: list[str] | None = None,
+) -> tuple[bool, str]:
     if _env_flag(f"{env_prefix}_FORCE_LLM", default=False):
-        return False
+        return False, "force_llm"
     if not _env_flag(f"{env_prefix}_SKIP_SIMPLE_ENGLISH", default=True):
-        return False
-    return _looks_like_simple_english_catalog_query(product_query, query_aliases, category_hints)
+        return False, "skip_disabled"
+    if _looks_like_simple_english_catalog_query(product_query, query_aliases, category_hints):
+        return True, "rules_simple_english"
+    if _looks_like_prepared_catalog_query(product_query, query_aliases, category_hints):
+        return True, "rules_prepared_catalog_input"
+    return False, "llm_required"
 
 
 def _parse_confidence(value: object) -> float | None:
@@ -696,13 +755,19 @@ class ProductRecallQueryAssistant:
         category_hints: list[str] | None = None,
         marketplace: str = "US",
     ) -> ProductQueryAssistantResult:
-        if _should_skip_llm_for_simple_query(self.env_prefix, product_query, query_aliases, category_hints):
+        should_skip_llm, skip_mode = _should_skip_llm_for_catalog_query(
+            self.env_prefix,
+            product_query,
+            query_aliases,
+            category_hints,
+        )
+        if should_skip_llm:
             provider = self.provider()
             extraction = _build_theme_extraction_result(
                 product_query,
                 list(query_aliases or []),
                 list(category_hints or []),
-                mode="rules_simple_english",
+                mode=skip_mode,
                 llm_used=False,
                 llm_provider=provider.provider_name,
                 llm_model=provider.model or None,
@@ -712,7 +777,7 @@ class ProductRecallQueryAssistant:
                 extraction.extracted_theme,
                 extraction.query_aliases,
                 extraction.category_hints,
-                mode="rules_simple_english",
+                mode=skip_mode,
                 llm_used=False,
                 llm_provider=provider.provider_name,
                 llm_model=provider.model or None,

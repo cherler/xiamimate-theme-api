@@ -3152,7 +3152,7 @@ class ProductThemeService:
             lineage=candidate_pool_lineage,
         )
 
-        return {
+        response_data = {
             "marketplace": marketplace,
             "domain": domain,
             "candidate_pool_id": candidate_pool_id,
@@ -3269,7 +3269,85 @@ class ProductThemeService:
                 "built-in Chinese-to-English query expansion remains as a fallback bridge for common product terms when source data is English-dominant",
                 "business_priority and recent data completeness are used as ranking boosters, not hard filters",
             ],
+            "response_profile": request.response_profile,
         }
+
+        if request.response_profile == "compact" and not request.include_debug:
+            query_normalization = response_data.get("query_normalization") or {}
+            pipeline_llm_used = bool(query_normalization.get("pipeline_llm_used"))
+
+            def compact_candidate_item(item: dict[str, Any]) -> dict[str, Any]:
+                return {
+                    key: value
+                    for key, value in {
+                        "asin": item.get("asin"),
+                        "product_title": item.get("product_title"),
+                        "brand": item.get("brand"),
+                        "category": item.get("category"),
+                        "category_path": item.get("category_path"),
+                        "leaf_category_name": item.get("leaf_category_name"),
+                        "fine_category_name": item.get("fine_category_name"),
+                        "current_price": item.get("current_price"),
+                        "current_rating": item.get("current_rating"),
+                        "current_review_count": item.get("current_review_count"),
+                        "current_offer_count": item.get("current_offer_count"),
+                    }.items()
+                    if value is not None and value != ""
+                }
+
+            return {
+                "marketplace": response_data["marketplace"],
+                "domain": response_data["domain"],
+                "candidate_pool_id": response_data["candidate_pool_id"],
+                "candidate_pool_version": response_data["candidate_pool_version"],
+                "candidate_pool_persistence": response_data["candidate_pool_persistence"],
+                "raw_product_query": response_data["raw_product_query"],
+                "recall_mode": response_data["recall_mode"],
+                "category_constraint": response_data["category_constraint"],
+                "expand_if_small": response_data["expand_if_small"],
+                "normalized_query": response_data["normalized_query"],
+                "query_phrases": response_data["query_phrases"][:5],
+                "query_tokens": response_data["query_tokens"][:12],
+                "query_expansions": response_data["query_expansions"][:8],
+                "required_product_terms": response_data["required_product_terms"][:8],
+                "effective_required_product_terms": response_data["effective_required_product_terms"][:8],
+                "timing_ms": response_data["timing_ms"],
+                "query_normalization_summary": {
+                    "mode": query_normalization.get("mode"),
+                    "pipeline_mode": query_normalization.get("pipeline_mode"),
+                    "llm_used": query_normalization.get("llm_used"),
+                    "pipeline_llm_used": pipeline_llm_used,
+                    "llm_provider": query_normalization.get("llm_provider"),
+                    "llm_model": query_normalization.get("llm_model"),
+                    "llm_confidence": query_normalization.get("llm_confidence"),
+                    "normalized_product_query": query_normalization.get("normalized_product_query"),
+                    "normalized_query_aliases": query_normalization.get("normalized_query_aliases") or [],
+                    "normalized_category_hints": query_normalization.get("normalized_category_hints") or [],
+                },
+                "candidate_count": response_data["candidate_count"],
+                "candidate_total_before_truncate": response_data["candidate_total_before_truncate"],
+                "candidate_total_before_semantic_category_anchor": response_data[
+                    "candidate_total_before_semantic_category_anchor"
+                ],
+                "pool_quality": response_data["pool_quality"],
+                "semantic_fine_category_anchor_applied": response_data["semantic_fine_category_anchor_applied"],
+                "semantic_category_anchor_applied": response_data["semantic_category_anchor_applied"],
+                "candidate_sql_prefilter_count": response_data["candidate_sql_prefilter_count"],
+                "candidate_sql_prefilter_limit": response_data["candidate_sql_prefilter_limit"],
+                "candidate_sql_prefilter_truncated": response_data["candidate_sql_prefilter_truncated"],
+                "category_scope_applied": response_data["category_scope_applied"],
+                "truncated": response_data["truncated"],
+                "matched_categories": response_data["matched_categories"][:10],
+                "matched_leaf_categories": response_data["matched_leaf_categories"],
+                "matched_fine_categories": response_data["matched_fine_categories"],
+                "matched_root_categories": response_data["matched_root_categories"],
+                "matched_keywords": response_data["matched_keywords"][:12],
+                "candidate_asins": response_data["candidate_asins"],
+                "candidate_items": [compact_candidate_item(item) for item in candidate_items],
+                "response_profile": "compact",
+            }
+
+        return response_data
 
     def get_candidate_pool_stats(self, request: CandidatePoolRequest) -> dict[str, Any]:
         domain, marketplace = _normalize_marketplace(request.marketplace)
@@ -4738,6 +4816,7 @@ class ProductThemeService:
                     PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY bsr) AS median_bsr,
                     SUM(COALESCE(monthly_sold, 0)) AS sum_monthly_sold,
                     AVG(monthly_sold) AS avg_monthly_sold,
+                    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY monthly_sold) AS median_monthly_sold,
                     PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY offer_count) AS median_offer_count
                 FROM latest_history
                 """,
@@ -4781,6 +4860,7 @@ class ProductThemeService:
             },
             "sum_monthly_sold": _safe_round(stats.get("sum_monthly_sold")),
             "avg_monthly_sold": _safe_round(stats.get("avg_monthly_sold")),
+            "median_monthly_sold": _safe_round(stats.get("median_monthly_sold")),
             "median_offer_count": _safe_round(stats.get("median_offer_count")),
         }
 

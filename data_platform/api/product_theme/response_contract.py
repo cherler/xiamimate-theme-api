@@ -229,12 +229,19 @@ def _with_response_contract(endpoint: str, data: dict[str, Any]) -> dict[str, An
     return enriched
 
 
-def _success_response(endpoint: str, data: dict[str, Any], message: str) -> dict[str, Any]:
+def _success_response(
+    endpoint: str,
+    data: dict[str, Any],
+    message: str,
+    *,
+    include_response_contract: bool = True,
+) -> dict[str, Any]:
+    response_data = _with_response_contract(endpoint, data) if include_response_contract else data
     return {
         "success": True,
         "code": "OK",
         "message": message,
-        "data": _with_response_contract(endpoint, data),
+        "data": response_data,
         "meta": _response_meta(endpoint),
     }
 

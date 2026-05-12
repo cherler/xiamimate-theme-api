@@ -200,6 +200,7 @@ def create_product_theme_app(
             endpoint="/api/product-theme/resolve-candidates",
             message="candidate pool resolved",
             data=await service.resolve_candidates(request),
+            include_response_contract=request.include_response_contract,
         )
 
     @app.post("/api/product-theme/category-resolve")
