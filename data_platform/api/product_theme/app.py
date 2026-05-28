@@ -16,10 +16,13 @@ from data_platform.api.product_theme.constants import (
 from data_platform.api.product_theme.db import _postgres_conn, _run_pg_dict_query
 from data_platform.api.product_theme.response_contract import _error_response, _response_meta, _success_response
 from data_platform.api.product_theme.schemas import (
+    AmazonKeywordDemandRequest,
     AsinHistoryTimeseriesRequest,
+    AsinReviewInsightsRequest,
     CandidateExpansionJobRequest,
     CandidateExpansionJobStatusRequest,
     CandidatePoolRequest,
+    CandidatePoolSliceRequest,
     CategoryBenchmarkRequest,
     CategoryResolveRequest,
     DrilldownRequest,
@@ -251,6 +254,14 @@ def create_product_theme_app(
             data=service.get_candidate_pool_stats(request),
         )
 
+    @app.post("/api/product-theme/candidate-pool-slice")
+    def candidate_pool_slice(request: CandidatePoolSliceRequest) -> dict[str, Any]:
+        return _success_response(
+            endpoint="/api/product-theme/candidate-pool-slice",
+            message="candidate pool slice ready",
+            data=service.get_candidate_pool_slice(request),
+        )
+
     @app.post("/api/product-theme/candidate-pool-trends")
     def candidate_pool_trends(request: CandidatePoolRequest) -> dict[str, Any]:
         return _success_response(
@@ -297,6 +308,22 @@ def create_product_theme_app(
             endpoint="/api/product-theme/asin-history-timeseries",
             message="asin history timeseries loaded",
             data=service.get_asin_history_timeseries(request),
+        )
+
+    @app.post("/api/product-theme/asin-review-insights")
+    def asin_review_insights(request: AsinReviewInsightsRequest) -> dict[str, Any]:
+        return _success_response(
+            endpoint="/api/product-theme/asin-review-insights",
+            message="asin review insights checked",
+            data=service.get_asin_review_insights(request),
+        )
+
+    @app.post("/api/product-theme/amazon-keyword-demand")
+    def amazon_keyword_demand(request: AmazonKeywordDemandRequest) -> dict[str, Any]:
+        return _success_response(
+            endpoint="/api/product-theme/amazon-keyword-demand",
+            message="amazon keyword demand checked",
+            data=service.get_amazon_keyword_demand(request),
         )
 
     @app.post("/api/product-theme/category-benchmark")

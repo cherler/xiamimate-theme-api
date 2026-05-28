@@ -90,10 +90,13 @@ from data_platform.api.product_theme.query_utils import (
 from data_platform.api.product_theme.response_contract import _success_response
 from data_platform.api.product_theme.services.launch_budget import calculate_launch_budget
 from data_platform.api.product_theme.schemas import (
+    AmazonKeywordDemandRequest,
     AsinHistoryTimeseriesRequest,
+    AsinReviewInsightsRequest,
     CandidateExpansionJobRequest,
     CandidateExpansionJobStatusRequest,
     CandidatePoolRequest,
+    CandidatePoolSliceRequest,
     CategoryBenchmarkRequest,
     CategoryResolveRequest,
     DrilldownRequest,
@@ -3793,6 +3796,349 @@ class ProductThemeService:
             "top_categories": top_category_list,
             "data_max_date": stats.get("max_date"),
             "sales_forecast": sales_forecast,
+        }
+
+    def get_candidate_pool_slice(self, request: CandidatePoolSliceRequest) -> dict[str, Any]:
+        domain, marketplace = _normalize_marketplace(request.marketplace)
+        candidate_asins, candidate_pool_ref = self._resolve_candidate_asins_for_pool_request(
+            request,
+            domain=domain,
+            marketplace=marketplace,
+        )
+        effective_window_days = _effective_feature_window_days(request.window_days)
+
+        with _postgres_conn() as conn:
+            rows = _run_pg_dict_query(
+                conn,
+                """
+            WITH max_date AS (
+                SELECT MAX(date) AS max_date
+                FROM serving.theme_base_daily
+                WHERE domain = %s
+            ),
+            filtered AS (
+                SELECT *
+                FROM serving.theme_base_daily
+                WHERE domain = %s
+                  AND asin = ANY(%s)
+                  AND date >= (
+                      SELECT max_date - (%s * INTERVAL '1 day')
+                      FROM max_date
+                  )
+            ),
+            latest_ranked AS (
+                SELECT
+                    asin,
+                    domain,
+                    product_title,
+                    brand,
+                    category,
+                    effective_price,
+                    rating,
+                    review_count,
+                    COALESCE(new_offer_count, 0) + COALESCE(used_offer_count, 0) AS offer_count,
+                    bsr,
+                    estimated_daily_sales,
+                    date,
+                    ROW_NUMBER() OVER (PARTITION BY asin, domain ORDER BY date DESC) AS rn
+                FROM filtered
+            ),
+            latest AS (
+                SELECT *
+                FROM latest_ranked
+                WHERE rn = 1
+            ),
+            summary AS (
+                SELECT
+                    asin,
+                    domain,
+                    SUM(COALESCE(estimated_daily_sales, 0)) AS sales_window_sum,
+                    AVG(estimated_daily_sales) AS sales_daily_avg,
+                    MIN(effective_price) AS price_min_window,
+                    MAX(effective_price) AS price_max_window,
+                    MAX(review_count) - MIN(review_count) AS review_growth_window,
+                    AVG(COALESCE(new_offer_count, 0) + COALESCE(used_offer_count, 0)) AS offer_count_avg_window,
+                    AVG(bsr) AS bsr_avg_window
+                FROM filtered
+                GROUP BY 1, 2
+            )
+            SELECT
+                l.asin,
+                l.product_title,
+                l.brand,
+                l.category,
+                l.effective_price,
+                l.rating,
+                l.review_count,
+                l.offer_count,
+                l.bsr,
+                l.estimated_daily_sales,
+                l.date AS latest_date,
+                s.sales_window_sum,
+                s.sales_daily_avg,
+                s.price_min_window,
+                s.price_max_window,
+                s.review_growth_window,
+                s.offer_count_avg_window,
+                s.bsr_avg_window,
+                (SELECT max_date FROM max_date) AS max_date
+            FROM latest l
+            LEFT JOIN summary s USING (asin, domain)
+                """,
+                [domain, domain, candidate_asins, effective_window_days - 1],
+            )
+
+        brand_terms = [term.strip().lower() for term in request.brand_include if term.strip()]
+        title_terms = [term.strip().lower() for term in request.title_keywords if term.strip()]
+        material_terms = [term.strip().lower() for term in request.material_keywords if term.strip()]
+
+        def row_matches(row: dict[str, Any]) -> bool:
+            brand_text = str(row.get("brand") or "").lower()
+            searchable_text = " ".join(
+                str(row.get(key) or "") for key in ("product_title", "category", "brand")
+            ).lower()
+            if brand_terms and not any(term in brand_text for term in brand_terms):
+                return False
+            if title_terms and not any(term in searchable_text for term in title_terms):
+                return False
+            if material_terms and not any(term in searchable_text for term in material_terms):
+                return False
+            return True
+
+        matched_rows = [dict(row) for row in rows if row_matches(row)]
+
+        sort_by = request.sort_by
+        sort_field = {
+            "sales_window_sum": "sales_window_sum",
+            "sales_daily_avg": "sales_daily_avg",
+            "review_count": "review_count",
+            "rating": "rating",
+            "bsr": "bsr",
+            "price": "effective_price",
+        }[sort_by]
+
+        def numeric_value(row: dict[str, Any], field: str) -> float | None:
+            value = row.get(field)
+            if value is None:
+                return None
+            with contextlib.suppress(TypeError, ValueError):
+                return float(value)
+            return None
+
+        if sort_by == "bsr":
+            matched_rows.sort(key=lambda row: numeric_value(row, sort_field) if numeric_value(row, sort_field) is not None else float("inf"))
+        else:
+            matched_rows.sort(key=lambda row: numeric_value(row, sort_field) if numeric_value(row, sort_field) is not None else float("-inf"), reverse=True)
+
+        top_rows = matched_rows[: request.top_n]
+
+        def percentile(values: list[float], ratio: float) -> float | None:
+            if not values:
+                return None
+            ordered = sorted(values)
+            if len(ordered) == 1:
+                return ordered[0]
+            position = (len(ordered) - 1) * ratio
+            lower = int(position)
+            upper = min(lower + 1, len(ordered) - 1)
+            weight = position - lower
+            return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+        ratings = [value for value in (numeric_value(row, "rating") for row in matched_rows) if value is not None]
+        review_counts = [value for value in (numeric_value(row, "review_count") for row in matched_rows) if value is not None]
+        brands: dict[str, int] = {}
+        for row in matched_rows:
+            brand = str(row.get("brand") or "UNKNOWN").strip() or "UNKNOWN"
+            brands[brand] = brands.get(brand, 0) + 1
+
+        def rating_bucket(value: float | None) -> str:
+            if value is None:
+                return "missing"
+            if value >= 4.7:
+                return "4.7_plus"
+            if value >= 4.5:
+                return "4.5_to_4.69"
+            if value >= 4.3:
+                return "4.3_to_4.49"
+            return "below_4.3"
+
+        def review_bucket(value: float | None) -> str:
+            if value is None:
+                return "missing"
+            if value < 100:
+                return "lt_100"
+            if value < 500:
+                return "100_to_499"
+            if value < 2000:
+                return "500_to_1999"
+            return "2000_plus"
+
+        rating_buckets: dict[str, int] = {}
+        review_buckets: dict[str, int] = {}
+        for row in matched_rows:
+            rb = rating_bucket(numeric_value(row, "rating"))
+            cb = review_bucket(numeric_value(row, "review_count"))
+            rating_buckets[rb] = rating_buckets.get(rb, 0) + 1
+            review_buckets[cb] = review_buckets.get(cb, 0) + 1
+
+        def compact_item(row: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "asin": row.get("asin"),
+                "product_title": row.get("product_title"),
+                "brand": row.get("brand"),
+                "category": row.get("category"),
+                "effective_price": round(float(row["effective_price"]), 2) if row.get("effective_price") is not None else None,
+                "rating": round(float(row["rating"]), 2) if row.get("rating") is not None else None,
+                "review_count": int(row.get("review_count") or 0) if row.get("review_count") is not None else None,
+                "bsr": int(row.get("bsr") or 0) if row.get("bsr") is not None else None,
+                "estimated_daily_sales": round(float(row["estimated_daily_sales"]), 2) if row.get("estimated_daily_sales") is not None else None,
+                "sales_window_sum": round(float(row["sales_window_sum"]), 2) if row.get("sales_window_sum") is not None else None,
+                "sales_daily_avg": round(float(row["sales_daily_avg"]), 2) if row.get("sales_daily_avg") is not None else None,
+                "review_growth_window": round(float(row["review_growth_window"]), 2) if row.get("review_growth_window") is not None else None,
+                "offer_count_avg_window": round(float(row["offer_count_avg_window"]), 2) if row.get("offer_count_avg_window") is not None else None,
+                "latest_date": row.get("latest_date"),
+            }
+
+        return {
+            "marketplace": marketplace,
+            "domain": domain,
+            "candidate_pool": candidate_pool_ref,
+            "data_source": "local_postgres",
+            "source_table": "serving.theme_base_daily",
+            "window_days": effective_window_days,
+            "filters": {
+                "brand_include": request.brand_include,
+                "title_keywords": request.title_keywords,
+                "material_keywords": request.material_keywords,
+            },
+            "sort_by": sort_by,
+            "top_n": request.top_n,
+            "total_candidate_count": len(candidate_asins),
+            "scanned_asin_count": len(rows),
+            "slice_count": len(matched_rows),
+            "items": [compact_item(row) for row in top_rows],
+            "rating_distribution": {
+                "avg": round(sum(ratings) / len(ratings), 2) if ratings else None,
+                "median": round(float(median(ratings)), 2) if ratings else None,
+                "p25": round(float(percentile(ratings, 0.25)), 2) if ratings else None,
+                "p75": round(float(percentile(ratings, 0.75)), 2) if ratings else None,
+                "buckets": rating_buckets,
+            },
+            "review_count_distribution": {
+                "median": int(median(review_counts)) if review_counts else None,
+                "p25": int(percentile(review_counts, 0.25)) if review_counts else None,
+                "p75": int(percentile(review_counts, 0.75)) if review_counts else None,
+                "buckets": review_buckets,
+            },
+            "top_brands": [
+                {"name": name, "count": count}
+                for name, count in sorted(brands.items(), key=lambda item: (-item[1], item[0]))[:10]
+            ],
+            "data_max_date": rows[0].get("max_date") if rows else None,
+            "limitations": [
+                "slice filters use local catalog title/category/brand fields; they do not include review text semantics",
+                "material_keywords are matched against product title/category text until a normalized material taxonomy is available",
+            ],
+        }
+
+    def get_asin_review_insights(self, request: AsinReviewInsightsRequest) -> dict[str, Any]:
+        domain, marketplace = _normalize_marketplace(request.marketplace)
+        candidate_asins, candidate_pool_ref = self._resolve_candidate_asins_for_pool_request(
+            request,
+            domain=domain,
+            marketplace=marketplace,
+        )
+        asins = candidate_asins[: request.max_asins]
+        provider_url = (os.getenv("ASIN_REVIEW_INSIGHTS_PROVIDER_URL") or "").strip()
+        if not provider_url:
+            return {
+                "marketplace": marketplace,
+                "domain": domain,
+                "candidate_pool": candidate_pool_ref,
+                "asins": asins,
+                "provider_status": "provider_required",
+                "provider_configured": False,
+                "supported_now": False,
+                "required_provider": "asin_review_insights",
+                "missing_capability": "review_text_provider",
+                "message": "当前本地数据只包含评分和评论数量，不包含评论正文；无法生成真实评论关键词、痛点聚类或低分原因。",
+                "available_alternatives": ["candidate_pool_slice.rating_distribution", "candidate_pool_slice.review_count_distribution", "top_asin_drilldown.rating_and_review_counts"],
+            }
+        try:
+            response = http_requests.post(
+                provider_url,
+                json={"marketplace": marketplace, "domain": domain, "asins": asins},
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            return {
+                "marketplace": marketplace,
+                "domain": domain,
+                "candidate_pool": candidate_pool_ref,
+                "asins": asins,
+                "provider_status": "provider_error",
+                "provider_configured": True,
+                "supported_now": False,
+                "error": str(exc)[:500],
+            }
+        return {
+            "marketplace": marketplace,
+            "domain": domain,
+            "candidate_pool": candidate_pool_ref,
+            "asins": asins,
+            "provider_status": "ready",
+            "provider_configured": True,
+            "supported_now": True,
+            "insights": payload,
+        }
+
+    def get_amazon_keyword_demand(self, request: AmazonKeywordDemandRequest) -> dict[str, Any]:
+        domain, marketplace = _normalize_marketplace(request.marketplace)
+        keywords = [keyword.strip() for keyword in request.keywords if keyword.strip()]
+        if not keywords and request.product_query:
+            keywords = [request.product_query]
+        provider_url = (os.getenv("AMAZON_KEYWORD_DEMAND_PROVIDER_URL") or "").strip()
+        if not provider_url:
+            return {
+                "marketplace": marketplace,
+                "domain": domain,
+                "keywords": keywords,
+                "provider_status": "provider_required",
+                "provider_configured": False,
+                "supported_now": False,
+                "required_provider": "amazon_keyword_demand",
+                "missing_capability": "amazon_keyword_volume_provider",
+                "message": "当前未配置 Amazon 关键词量 provider，不能输出真实月搜索量；可用 Google Trends 指数或 ASIN 销量/评论分布作为替代验证。",
+                "available_alternatives": ["candidate_pool_trends.google_trends_index", "candidate_pool_slice.sales_window_sum", "top_asin_drilldown.sales_and_review_counts"],
+            }
+        try:
+            response = http_requests.post(
+                provider_url,
+                json={"marketplace": marketplace, "domain": domain, "keywords": keywords, "product_query": request.product_query},
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            return {
+                "marketplace": marketplace,
+                "domain": domain,
+                "keywords": keywords,
+                "provider_status": "provider_error",
+                "provider_configured": True,
+                "supported_now": False,
+                "error": str(exc)[:500],
+            }
+        return {
+            "marketplace": marketplace,
+            "domain": domain,
+            "keywords": keywords,
+            "provider_status": "ready",
+            "provider_configured": True,
+            "supported_now": True,
+            "demand": payload,
         }
 
     def get_candidate_pool_trends(self, request: CandidatePoolRequest) -> dict[str, Any]:

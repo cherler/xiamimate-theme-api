@@ -100,6 +100,61 @@ class CandidatePoolRequest(BaseModel):
         return values
 
 
+class CandidatePoolSliceRequest(CandidatePoolRequest):
+    brand_include: list[str] = Field(default_factory=list)
+    title_keywords: list[str] = Field(default_factory=list)
+    material_keywords: list[str] = Field(default_factory=list)
+    sort_by: str = "sales_window_sum"
+    top_n: int = Field(default=3, ge=1, le=20)
+
+    @validator("brand_include", "title_keywords", "material_keywords", pre=True, always=True)
+    def _accept_csv_terms(cls, v: Any) -> list[str]:  # noqa: N805
+        if isinstance(v, str):
+            return [s.strip() for s in v.split(",") if s.strip()]
+        if v is None:
+            return []
+        return [str(s).strip() for s in v if str(s).strip()]
+
+    @validator("sort_by")
+    def _validate_sort_by(cls, v: str) -> str:  # noqa: N805
+        value = (v or "sales_window_sum").strip().lower()
+        allowed = {"sales_window_sum", "sales_daily_avg", "review_count", "rating", "bsr", "price"}
+        if value not in allowed:
+            raise ValueError("sort_by must be one of: sales_window_sum, sales_daily_avg, review_count, rating, bsr, price")
+        return value
+
+
+class AsinReviewInsightsRequest(CandidatePoolRequest):
+    max_asins: int = Field(default=10, ge=1, le=20)
+
+
+class AmazonKeywordDemandRequest(BaseModel):
+    keywords: list[str] = Field(default_factory=list)
+    product_query: Optional[str] = None
+    marketplace: Union[str, int] = "US"
+
+    @validator("keywords", pre=True, always=True)
+    def _accept_csv_keywords(cls, v: Any) -> list[str]:  # noqa: N805
+        if isinstance(v, str):
+            return [s.strip() for s in v.split(",") if s.strip()]
+        if v is None:
+            return []
+        return [str(s).strip() for s in v if str(s).strip()]
+
+    @validator("product_query", pre=True, always=True)
+    def _normalize_optional_product_query(cls, v: Any) -> Optional[str]:  # noqa: N805
+        if v is None:
+            return None
+        value = str(v).strip()
+        return value or None
+
+    @root_validator(skip_on_failure=True)
+    def _require_keywords_or_query(cls, values: dict[str, Any]) -> dict[str, Any]:  # noqa: N805
+        if not values.get("keywords") and not values.get("product_query"):
+            raise ValueError("keywords or product_query is required")
+        return values
+
+
 class CategoryBenchmarkRequest(CandidatePoolRequest):
     benchmark_category_id: Optional[int] = None
     benchmark_category_path: Optional[str] = None

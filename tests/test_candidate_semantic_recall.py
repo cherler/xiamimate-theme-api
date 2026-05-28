@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import unittest
 from unittest.mock import patch
 
 from fastapi import HTTPException
 
 from data_platform.api.product_theme_api import (
+    AmazonKeywordDemandRequest,
+    AsinReviewInsightsRequest,
     CandidateRecord,
     CategoryBenchmarkRequest,
     CandidatePoolRequest,
+    CandidatePoolSliceRequest,
     CandidateExpansionJobRequest,
     CandidateExpansionJobStatusRequest,
     LaunchBudgetCalculatorRequest,
@@ -313,6 +317,138 @@ class CandidateSemanticRecallTests(unittest.TestCase):
 
         self.assertEqual(request.candidate_asins, [])
         self.assertEqual(request.candidate_pool_id, "11111111-1111-4111-8111-111111111111")
+
+    def test_candidate_pool_slice_filters_brand_and_material(self) -> None:
+        service = ProductThemeService()
+        request = CandidatePoolSliceRequest(
+            candidate_asins=["B000000001", "B000000002", "B000000003", "B000000004"],
+            marketplace="US",
+            brand_include="SUNLU,Creality",
+            material_keywords="PLA",
+            top_n=2,
+            sort_by="sales_window_sum",
+        )
+        rows = [
+            {
+                "asin": "B000000001",
+                "product_title": "SUNLU PLA 1.75mm filament",
+                "brand": "SUNLU",
+                "category": "3D Printing Filament",
+                "effective_price": 18.99,
+                "rating": 4.4,
+                "review_count": 800,
+                "offer_count": 4,
+                "bsr": 1200,
+                "estimated_daily_sales": 12.0,
+                "latest_date": "2026-05-20",
+                "sales_window_sum": 360.0,
+                "sales_daily_avg": 12.0,
+                "price_min_window": 17.99,
+                "price_max_window": 19.99,
+                "review_growth_window": 25,
+                "offer_count_avg_window": 4.0,
+                "bsr_avg_window": 1250,
+                "max_date": "2026-05-20",
+            },
+            {
+                "asin": "B000000002",
+                "product_title": "Creality PLA filament 1kg",
+                "brand": "Creality",
+                "category": "3D Printing Filament",
+                "effective_price": 21.99,
+                "rating": 4.6,
+                "review_count": 400,
+                "offer_count": 3,
+                "bsr": 1800,
+                "estimated_daily_sales": 7.0,
+                "latest_date": "2026-05-20",
+                "sales_window_sum": 210.0,
+                "sales_daily_avg": 7.0,
+                "price_min_window": 20.99,
+                "price_max_window": 22.99,
+                "review_growth_window": 12,
+                "offer_count_avg_window": 3.0,
+                "bsr_avg_window": 1820,
+                "max_date": "2026-05-20",
+            },
+            {
+                "asin": "B000000003",
+                "product_title": "SUNLU ABS filament",
+                "brand": "SUNLU",
+                "category": "3D Printing Filament",
+                "effective_price": 20.99,
+                "rating": 4.2,
+                "review_count": 200,
+                "offer_count": 5,
+                "bsr": 2000,
+                "estimated_daily_sales": 5.0,
+                "latest_date": "2026-05-20",
+                "sales_window_sum": 150.0,
+                "sales_daily_avg": 5.0,
+                "price_min_window": 19.99,
+                "price_max_window": 21.99,
+                "review_growth_window": 5,
+                "offer_count_avg_window": 5.0,
+                "bsr_avg_window": 2050,
+                "max_date": "2026-05-20",
+            },
+            {
+                "asin": "B000000004",
+                "product_title": "eSUN PLA filament",
+                "brand": "eSUN",
+                "category": "3D Printing Filament",
+                "effective_price": 19.99,
+                "rating": 4.7,
+                "review_count": 1600,
+                "offer_count": 6,
+                "bsr": 900,
+                "estimated_daily_sales": 14.0,
+                "latest_date": "2026-05-20",
+                "sales_window_sum": 420.0,
+                "sales_daily_avg": 14.0,
+                "price_min_window": 18.99,
+                "price_max_window": 20.99,
+                "review_growth_window": 31,
+                "offer_count_avg_window": 6.0,
+                "bsr_avg_window": 940,
+                "max_date": "2026-05-20",
+            },
+        ]
+
+        with patch("data_platform.api.product_theme_api._postgres_conn", return_value=contextlib.nullcontext(object())):
+            with patch("data_platform.api.product_theme_api._run_pg_dict_query", return_value=rows):
+                result = service.get_candidate_pool_slice(request)
+
+        self.assertEqual(result["slice_count"], 2)
+        self.assertEqual([item["asin"] for item in result["items"]], ["B000000001", "B000000002"])
+        self.assertEqual(result["rating_distribution"]["buckets"]["4.3_to_4.49"], 1)
+        self.assertEqual(result["rating_distribution"]["buckets"]["4.5_to_4.69"], 1)
+        self.assertEqual(result["top_brands"][0], {"name": "Creality", "count": 1})
+        self.assertIn("serving.theme_base_daily", result["source_table"])
+
+    def test_stage_c_review_insights_returns_provider_required_without_provider(self) -> None:
+        service = ProductThemeService()
+        request = AsinReviewInsightsRequest(candidate_asins=["B000000001", "B000000002"], max_asins=1)
+
+        with patch.dict(os.environ, {"ASIN_REVIEW_INSIGHTS_PROVIDER_URL": ""}):
+            result = service.get_asin_review_insights(request)
+
+        self.assertEqual(result["provider_status"], "provider_required")
+        self.assertFalse(result["supported_now"])
+        self.assertEqual(result["asins"], ["B000000001"])
+        self.assertIn("评论正文", result["message"])
+
+    def test_stage_c_keyword_demand_returns_provider_required_without_provider(self) -> None:
+        service = ProductThemeService()
+        request = AmazonKeywordDemandRequest(keywords="carbon fiber PLA, matte PLA", marketplace="US")
+
+        with patch.dict(os.environ, {"AMAZON_KEYWORD_DEMAND_PROVIDER_URL": ""}):
+            result = service.get_amazon_keyword_demand(request)
+
+        self.assertEqual(result["provider_status"], "provider_required")
+        self.assertFalse(result["supported_now"])
+        self.assertEqual(result["keywords"], ["carbon fiber PLA", "matte PLA"])
+        self.assertIn("不能输出真实月搜索量", result["message"])
 
     def test_candidate_pool_lineage_records_query_category_and_filters(self) -> None:
         service = ProductThemeService()
