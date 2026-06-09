@@ -55,6 +55,7 @@ from data_platform.api.product_theme.constants import (
     DEFAULT_FEATURE_DIR,
     DEFAULT_MIN_CANDIDATE_POOL_SIZE,
     DEFAULT_TARGET_CANDIDATE_POOL_SIZE,
+    BENCHMARK_ANCHOR_MIN_REPRESENTATIVENESS,
     DOMAIN_TO_MARKETPLACE,
     FORECAST_HIGH_GROWTH_RATIO_THRESHOLD,
     FORECAST_STATUS_MISSING_ASIN_PREDICTION,
@@ -2320,12 +2321,14 @@ class ProductThemeService:
                 "trend_stage": trends.get("trend_stage") if trends else None,
                 "trend_wow": trends.get("trend_wow") if trends else None,
                 "trend_coverage": trend_coverage,
+                "trend_data_readiness": trends.get("trend_data_readiness") if trends else None,
                 "forecast_type": forecast.get("forecast_type"),
                 "bullish_asin_count": bullish_count,
                 "risk_asin_count": risk_count,
                 "predicted_top_asins": forecast.get("predicted_top_asins", [])[:5],
                 "benchmark_anchor": (benchmark or {}).get("benchmark_anchor"),
                 "benchmark_is_precise": (benchmark or {}).get("benchmark_is_precise"),
+                "benchmark_pool_representativeness": (benchmark or {}).get("pool_representativeness"),
                 "data_max_date": _iso_date_or_none(stats.get("data_max_date")),
             },
             "metric_explanations": self._build_query_metric_explanations(
@@ -4172,6 +4175,8 @@ class ProductThemeService:
             SELECT
                 COUNT(*) AS row_count,
                 COUNT(*) FILTER (WHERE trend_index_mean IS NOT NULL) AS trend_rows,
+                COUNT(DISTINCT asin) AS asin_present_count,
+                COUNT(DISTINCT asin) FILTER (WHERE trend_index_mean IS NOT NULL) AS asin_with_trend_count,
                 AVG(trend_index_mean) FILTER (WHERE date >= (SELECT max_date - INTERVAL '6 day' FROM max_date)) AS trend_7d_mean,
                 AVG(trend_index_mean) AS trend_30d_mean,
                 AVG(trend_index_wow) FILTER (WHERE date >= (SELECT max_date - INTERVAL '6 day' FROM max_date)) AS trend_wow,
@@ -4192,8 +4197,31 @@ class ProductThemeService:
         trend_wow = float(stats.get("trend_wow") or 0.0)
         trend_volatility = float(stats.get("trend_volatility") or 0.0)
 
-        if coverage == 0:
-            trend_stage = "no_signal"
+        # ── Data-readiness breakdown: distinguish "ASINs never synced into the
+        # trends serving table" (a hydration/readiness gap, retry later) from
+        # "ASINs present but Google Trends has no value" (a genuine long-tail /
+        # no-external-signal market). Conflating the two used to surface as a
+        # flat `no_signal`, leaving the LLM to guess. ──
+        asin_total = len(candidate_asins)
+        asin_present_count = int(stats.get("asin_present_count") or 0)
+        asin_with_trend_count = int(stats.get("asin_with_trend_count") or 0)
+        asins_missing_from_trends_table = max(0, asin_total - asin_present_count)
+        asins_present_but_null = max(0, asin_present_count - asin_with_trend_count)
+        asin_trend_coverage_ratio = round(asin_with_trend_count / asin_total, 4) if asin_total else 0.0
+
+        if asin_with_trend_count > 0:
+            trend_data_readiness = "ready" if asins_missing_from_trends_table == 0 else "partial"
+        elif asin_present_count == 0 and asin_total > 0:
+            # None of the candidate ASINs exist in the trends serving table yet.
+            trend_data_readiness = "not_ready"
+        else:
+            # ASINs are present but every trend_index value is null → no external signal.
+            trend_data_readiness = "no_external_signal"
+
+        if trend_data_readiness == "not_ready":
+            trend_stage = "data_not_ready"
+        elif asin_with_trend_count == 0 or coverage == 0:
+            trend_stage = "insufficient_data"
         elif trend_wow >= 3:
             trend_stage = "rising"
         elif trend_wow <= -3:
@@ -4202,6 +4230,23 @@ class ProductThemeService:
             trend_stage = "volatile"
         else:
             trend_stage = "flat"
+
+        trend_notes: list[str] = []
+        if trend_data_readiness == "not_ready":
+            trend_notes.append(
+                f"候选池 {asin_total} 个 ASIN 均未进入趋势 serving 表（serving.theme_trends_daily），"
+                "通常是补池后特征尚未 hydrate；这是数据未就绪而非市场无趋势，建议等待 serving sync 后重查，不要当成衰退/无热度结论"
+            )
+        elif trend_data_readiness == "no_external_signal":
+            trend_notes.append(
+                f"候选池 {asin_present_count} 个 ASIN 已同步但 Google Trends 无有效搜索指数，"
+                "属于真长尾/外部搜索信号不足；可改用更宽泛的同义关键词交叉验证，或以 candidate_pool_slice 等内部信号替代趋势判断"
+            )
+        elif trend_data_readiness == "partial":
+            trend_notes.append(
+                f"仅 {asin_with_trend_count}/{asin_total} 个候选 ASIN 有趋势数据"
+                f"（{asins_missing_from_trends_table} 个未同步、{asins_present_but_null} 个同步但无值），趋势结论仅代表已覆盖子集"
+            )
 
         return {
             "marketplace": marketplace,
@@ -4223,7 +4268,15 @@ class ProductThemeService:
             "keyword_coverage_ratio": round(float(stats.get("keyword_coverage_ratio") or 0.0), 4) if stats.get("keyword_coverage_ratio") is not None else None,
             "trend_data_coverage": coverage,
             "trend_stage": trend_stage,
+            "trend_data_readiness": trend_data_readiness,
+            "asin_total": asin_total,
+            "asin_present_count": asin_present_count,
+            "asin_with_trend_count": asin_with_trend_count,
+            "asins_missing_from_trends_table": asins_missing_from_trends_table,
+            "asins_present_but_null": asins_present_but_null,
+            "asin_trend_coverage_ratio": asin_trend_coverage_ratio,
             "data_max_date": stats.get("max_date"),
+            "notes": trend_notes,
         }
 
     def get_candidate_pool_weak_forecast(self, request: WeakForecastRequest) -> dict[str, Any]:
@@ -5183,6 +5236,9 @@ class ProductThemeService:
         anchor_confidence = 0.0
         fallback_reason: str | None = None
         all_l3_cats: list[dict[str, Any]] = []
+        # Number of candidate ASINs that resolved to an L3 ancestor (auto path only).
+        # None means "not measured" (explicit-anchor path skips the full pool walk).
+        resolved_asin_count: int | None = None
 
         with _postgres_conn() as conn:
             explicit_anchor = self._fetch_category_benchmark_anchor(
@@ -5351,6 +5407,7 @@ class ProductThemeService:
                 dominant_l3_en = l3_en_map[dominant_l3_id]
                 dominant_depth = l3_depth_map[dominant_l3_id]
                 anchor_confidence = round(dominant_count / max(len(candidate_asins), 1), 4)
+                resolved_asin_count = len({str(row["asin"]) for row in l3_rows})
 
                 # all L3 categories for transparency
                 all_l3_cats = [
@@ -5438,6 +5495,14 @@ class ProductThemeService:
 
         stats = bench_rows[0] if bench_rows else {}
         cat_total = int(stats.get("category_total_asin_count") or 0)
+        # Representativeness = how much of the candidate pool the chosen anchor actually
+        # covers. A "dominant" L3 that only covers 1/17 of the pool is a mode-of-singletons
+        # artifact, not a real benchmark; it must NOT be reported as precise even when the
+        # category itself is large.
+        pool_representativeness = round(dominant_count / max(len(candidate_asins), 1), 4)
+        uncategorized_asin_count = (
+            max(0, len(candidate_asins) - resolved_asin_count) if resolved_asin_count is not None else None
+        )
         local_category_coverage = {
             "candidate_asin_count_in_category": dominant_count,
             "category_total_asin_count": cat_total,
@@ -5445,8 +5510,17 @@ class ProductThemeService:
             "too_small": cat_total < DEFAULT_MIN_CANDIDATE_POOL_SIZE,
             "min_pool_size": DEFAULT_MIN_CANDIDATE_POOL_SIZE,
             "include_descendants": request.include_descendants,
+            "pool_representativeness": pool_representativeness,
+            "min_representativeness": BENCHMARK_ANCHOR_MIN_REPRESENTATIVENESS,
+            "anchor_is_representative": pool_representativeness >= BENCHMARK_ANCHOR_MIN_REPRESENTATIVENESS,
+            "resolved_asin_count": resolved_asin_count,
+            "uncategorized_asin_count": uncategorized_asin_count,
         }
-        benchmark_is_precise = dominant_depth >= 3 and not local_category_coverage["too_small"]
+        benchmark_is_precise = (
+            dominant_depth >= 3
+            and not local_category_coverage["too_small"]
+            and pool_representativeness >= BENCHMARK_ANCHOR_MIN_REPRESENTATIVENESS
+        )
 
         benchmark_stats = {
             "avg_price": _safe_round(stats.get("avg_price")),
@@ -5501,6 +5575,9 @@ class ProductThemeService:
             "candidate_asin_count_in_category": dominant_count,
             "category_total_asin_count": cat_total,
             "candidate_category_coverage_pct": local_category_coverage["candidate_category_coverage_pct"],
+            "pool_representativeness": pool_representativeness,
+            "resolved_asin_count": resolved_asin_count,
+            "uncategorized_asin_count": uncategorized_asin_count,
             "all_candidate_l3_categories": all_l3_cats,
             "benchmark_stats": benchmark_stats,
             "notes": [
@@ -5511,6 +5588,19 @@ class ProductThemeService:
                 ),
                 f"候选池中 {dominant_count}/{len(candidate_asins)} 个 ASIN 属于此类目",
                 "聚合范围包含锚点类目及其所有子类目下的全部 ASIN" if request.include_descendants else "聚合范围仅包含锚点类目本身",
+                *(
+                    [
+                        f"锚点仅代表候选池 {pool_representativeness:.0%}（< 阈值 {BENCHMARK_ANCHOR_MIN_REPRESENTATIVENESS:.0%}）"
+                        + (
+                            f"，其中 {uncategorized_asin_count} 个候选 ASIN 未解析出本地 L3 类目（多为补池后类目特征未就绪）"
+                            if uncategorized_asin_count
+                            else "，候选池跨多个 L3 类目、无单一主导类目"
+                        )
+                        + "；benchmark 仅代表池中少数 ASIN，不能当作候选池整体的品类基准结论"
+                    ]
+                    if pool_representativeness < BENCHMARK_ANCHOR_MIN_REPRESENTATIVENESS
+                    else []
+                ),
                 *( ["本地类目覆盖不足，benchmark 不应作为强品类结论"] if local_category_coverage["too_small"] else [] ),
                 *( [fallback_reason] if fallback_reason else [] ),
                 *( ["当前 benchmark 读取 PostgreSQL sync.keepa_product_history，在线窗口上限为近 90 天"] if request.window_days > effective_window_days else [] ),

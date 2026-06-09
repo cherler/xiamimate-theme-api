@@ -51,6 +51,11 @@ MIN_TOKEN_LENGTH = 2
 DEFAULT_MIN_CANDIDATE_POOL_SIZE = 8
 DEFAULT_TARGET_CANDIDATE_POOL_SIZE = 20
 DEFAULT_DOMINANT_CATEGORY_SHARE_THRESHOLD = 0.7
+# Minimum share of the candidate pool that the benchmark anchor must represent
+# before category_benchmark may claim benchmark_is_precise. A "dominant" L3 that
+# only covers a sliver of the pool (e.g. 1/17) is a representativeness artifact,
+# not a trustworthy benchmark, and must be flagged as imprecise.
+BENCHMARK_ANCHOR_MIN_REPRESENTATIVENESS = 0.30
 CANDIDATE_EXPANSION_ACTIVE_STATUSES = ("queued", "waiting_token", "discovering", "hydrating", "syncing")
 OPPORTUNITY_SCORE_WEIGHTS = {
     "demand_score": 0.20,

@@ -1237,5 +1237,189 @@ class CandidateSemanticRecallTests(unittest.TestCase):
         self.assertEqual(calls[0][1][0], result["opportunity_discovery_job_id"])
 
 
+class CandidatePoolTrendsReadinessTests(unittest.TestCase):
+    """candidate_pool_trends must separate 'features not hydrated yet' from
+    'genuine no external search signal' instead of collapsing both into no_signal."""
+
+    class _FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def _run_trends(self, trend_row: dict) -> dict:
+        service = ProductThemeService()
+        request = CandidatePoolRequest(candidate_asins=["B000000001", "B000000002"], marketplace="US")
+        with patch.object(
+            ProductThemeService,
+            "_resolve_candidate_asins_for_pool_request",
+            return_value=(["B000000001", "B000000002"], {"candidate_pool_id": None}),
+        ), patch(
+            "data_platform.api.product_theme_api._postgres_conn",
+            return_value=self._FakeConn(),
+        ), patch(
+            "data_platform.api.product_theme_api._run_pg_dict_query",
+            return_value=[trend_row],
+        ):
+            return service.get_candidate_pool_trends(request)
+
+    def test_trends_not_ready_when_asins_absent_from_serving_table(self) -> None:
+        result = self._run_trends(
+            {
+                "row_count": 0,
+                "trend_rows": 0,
+                "asin_present_count": 0,
+                "asin_with_trend_count": 0,
+                "trend_7d_mean": None,
+                "trend_30d_mean": None,
+                "trend_wow": None,
+                "trend_dod": None,
+                "trend_volatility": None,
+                "trend_peak_recent": None,
+                "keyword_coverage_ratio": None,
+                "max_date": None,
+            }
+        )
+        self.assertEqual(result["trend_data_readiness"], "not_ready")
+        self.assertEqual(result["trend_stage"], "data_not_ready")
+        self.assertEqual(result["asins_missing_from_trends_table"], 2)
+        self.assertTrue(any("未就绪" in note for note in result["notes"]))
+
+    def test_trends_no_external_signal_when_present_but_null(self) -> None:
+        result = self._run_trends(
+            {
+                "row_count": 40,
+                "trend_rows": 0,
+                "asin_present_count": 2,
+                "asin_with_trend_count": 0,
+                "trend_7d_mean": None,
+                "trend_30d_mean": None,
+                "trend_wow": None,
+                "trend_dod": None,
+                "trend_volatility": None,
+                "trend_peak_recent": None,
+                "keyword_coverage_ratio": 0.0,
+                "max_date": None,
+            }
+        )
+        self.assertEqual(result["trend_data_readiness"], "no_external_signal")
+        self.assertEqual(result["trend_stage"], "insufficient_data")
+        self.assertEqual(result["asins_present_but_null"], 2)
+        self.assertTrue(any("长尾" in note for note in result["notes"]))
+
+    def test_trends_ready_when_all_asins_have_trend(self) -> None:
+        result = self._run_trends(
+            {
+                "row_count": 60,
+                "trend_rows": 60,
+                "asin_present_count": 2,
+                "asin_with_trend_count": 2,
+                "trend_7d_mean": 20.7,
+                "trend_30d_mean": 16.8,
+                "trend_wow": 0.5,
+                "trend_dod": 0.1,
+                "trend_volatility": 2.0,
+                "trend_peak_recent": 30.0,
+                "keyword_coverage_ratio": 0.95,
+                "max_date": None,
+            }
+        )
+        self.assertEqual(result["trend_data_readiness"], "ready")
+        self.assertEqual(result["trend_stage"], "flat")
+        self.assertEqual(result["asin_trend_coverage_ratio"], 1.0)
+
+
+class CategoryBenchmarkRepresentativenessTests(unittest.TestCase):
+    """category_benchmark must not claim benchmark_is_precise when the 'dominant'
+    L3 anchor only covers a sliver of the candidate pool (mode-of-singletons)."""
+
+    class _FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    @staticmethod
+    def _bench_row(cat_total: int) -> dict:
+        return {
+            "category_total_asin_count": cat_total,
+            "avg_price": 26.29,
+            "price_p25": 9.99,
+            "price_p50": 15.52,
+            "price_p75": 25.20,
+            "avg_rating": 4.36,
+            "median_rating": 4.4,
+            "avg_review_count": 1800.0,
+            "median_review_count": 1695,
+            "avg_bsr": 5000.0,
+            "median_bsr": 3216,
+            "sum_monthly_sold": 99999,
+            "avg_monthly_sold": 700.0,
+            "median_monthly_sold": 600.0,
+            "median_offer_count": 5.0,
+        }
+
+    def _run_benchmark(self, l3_rows: list[dict], cat_total: int, candidate_count: int) -> dict:
+        service = ProductThemeService()
+        candidate_asins = [f"B{idx:09d}" for idx in range(1, candidate_count + 1)]
+        request = CategoryBenchmarkRequest(candidate_asins=candidate_asins, marketplace="US")
+
+        def fake_query(conn, sql, params):
+            if "candidate_leaf" in sql:
+                return l3_rows
+            return [self._bench_row(cat_total)]
+
+        with patch.object(
+            ProductThemeService,
+            "_resolve_candidate_asins_for_pool_request",
+            return_value=(candidate_asins, {"candidate_pool_id": None}),
+        ), patch(
+            "data_platform.api.product_theme_api._postgres_conn",
+            return_value=self._FakeConn(),
+        ), patch(
+            "data_platform.api.product_theme_api._run_pg_dict_query",
+            side_effect=fake_query,
+        ):
+            return service.get_category_benchmark(request)
+
+    def test_sliver_anchor_is_not_precise_and_flags_uncategorized(self) -> None:
+        l3_rows = [
+            {
+                "asin": "B000000001",
+                "l3_category_id": 100,
+                "l3_category_name": "Kitchen Utensils & Gadgets",
+                "l3_category_en": "Kitchen Utensils & Gadgets",
+                "depth": 3,
+            }
+        ]
+        result = self._run_benchmark(l3_rows, cat_total=677, candidate_count=17)
+        self.assertFalse(result["benchmark_is_precise"])
+        self.assertEqual(result["resolved_asin_count"], 1)
+        self.assertEqual(result["uncategorized_asin_count"], 16)
+        self.assertLess(result["pool_representativeness"], 0.30)
+        self.assertFalse(result["local_category_coverage"]["anchor_is_representative"])
+        self.assertTrue(any("不能当作候选池整体" in note for note in result["notes"]))
+
+    def test_representative_anchor_is_precise(self) -> None:
+        l3_rows = [
+            {
+                "asin": f"B{idx:09d}",
+                "l3_category_id": 100,
+                "l3_category_name": "Colanders & Strainers",
+                "l3_category_en": "Colanders & Strainers",
+                "depth": 3,
+            }
+            for idx in range(1, 16)  # 15 of 17 ASINs resolve to the same L3
+        ]
+        result = self._run_benchmark(l3_rows, cat_total=677, candidate_count=17)
+        self.assertTrue(result["benchmark_is_precise"])
+        self.assertEqual(result["resolved_asin_count"], 15)
+        self.assertEqual(result["uncategorized_asin_count"], 2)
+        self.assertGreaterEqual(result["pool_representativeness"], 0.30)
+        self.assertTrue(result["local_category_coverage"]["anchor_is_representative"])
+
+
 if __name__ == "__main__":
     unittest.main()
