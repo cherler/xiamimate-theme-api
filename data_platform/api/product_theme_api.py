@@ -3894,6 +3894,17 @@ class ProductThemeService:
         brand_terms = [term.strip().lower() for term in request.brand_include if term.strip()]
         title_terms = [term.strip().lower() for term in request.title_keywords if term.strip()]
         material_terms = [term.strip().lower() for term in request.material_keywords if term.strip()]
+        price_min = request.price_min
+        price_max = request.price_max
+        price_filter_active = price_min is not None or price_max is not None
+
+        def row_price(row: dict[str, Any]) -> float | None:
+            value = row.get("effective_price")
+            if value is None:
+                return None
+            with contextlib.suppress(TypeError, ValueError):
+                return float(value)
+            return None
 
         def row_matches(row: dict[str, Any]) -> bool:
             brand_text = str(row.get("brand") or "").lower()
@@ -3906,6 +3917,14 @@ class ProductThemeService:
                 return False
             if material_terms and not any(term in searchable_text for term in material_terms):
                 return False
+            if price_filter_active:
+                price = row_price(row)
+                if price is None:
+                    return False
+                if price_min is not None and price < price_min:
+                    return False
+                if price_max is not None and price > price_max:
+                    return False
             return True
 
         matched_rows = [dict(row) for row in rows if row_matches(row)]
@@ -3949,6 +3968,7 @@ class ProductThemeService:
 
         ratings = [value for value in (numeric_value(row, "rating") for row in matched_rows) if value is not None]
         review_counts = [value for value in (numeric_value(row, "review_count") for row in matched_rows) if value is not None]
+        prices = [value for value in (numeric_value(row, "effective_price") for row in matched_rows) if value is not None]
         brands: dict[str, int] = {}
         for row in matched_rows:
             brand = str(row.get("brand") or "UNKNOWN").strip() or "UNKNOWN"
@@ -3984,6 +4004,24 @@ class ProductThemeService:
             rating_buckets[rb] = rating_buckets.get(rb, 0) + 1
             review_buckets[cb] = review_buckets.get(cb, 0) + 1
 
+        def price_bucket(value: float | None) -> str:
+            if value is None:
+                return "missing"
+            if value < 10:
+                return "lt_10"
+            if value < 25:
+                return "10_to_24.99"
+            if value < 50:
+                return "25_to_49.99"
+            if value < 100:
+                return "50_to_99.99"
+            return "100_plus"
+
+        price_buckets: dict[str, int] = {}
+        for row in matched_rows:
+            pb = price_bucket(numeric_value(row, "effective_price"))
+            price_buckets[pb] = price_buckets.get(pb, 0) + 1
+
         def compact_item(row: dict[str, Any]) -> dict[str, Any]:
             return {
                 "asin": row.get("asin"),
@@ -4013,6 +4051,8 @@ class ProductThemeService:
                 "brand_include": request.brand_include,
                 "title_keywords": request.title_keywords,
                 "material_keywords": request.material_keywords,
+                "price_min": price_min,
+                "price_max": price_max,
             },
             "sort_by": sort_by,
             "top_n": request.top_n,
@@ -4033,6 +4073,14 @@ class ProductThemeService:
                 "p75": int(percentile(review_counts, 0.75)) if review_counts else None,
                 "buckets": review_buckets,
             },
+            "price_distribution": {
+                "min": round(float(min(prices)), 2) if prices else None,
+                "max": round(float(max(prices)), 2) if prices else None,
+                "median": round(float(median(prices)), 2) if prices else None,
+                "p25": round(float(percentile(prices, 0.25)), 2) if prices else None,
+                "p75": round(float(percentile(prices, 0.75)), 2) if prices else None,
+                "buckets": price_buckets,
+            },
             "top_brands": [
                 {"name": name, "count": count}
                 for name, count in sorted(brands.items(), key=lambda item: (-item[1], item[0]))[:10]
@@ -4041,6 +4089,7 @@ class ProductThemeService:
             "limitations": [
                 "slice filters use local catalog title/category/brand fields; they do not include review text semantics",
                 "material_keywords are matched against product title/category text until a normalized material taxonomy is available",
+                "price_min/price_max filter on each ASIN's latest effective_price snapshot; ASINs without a recent price are excluded when a price filter is set",
             ],
         }
 

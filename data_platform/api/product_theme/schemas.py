@@ -104,6 +104,8 @@ class CandidatePoolSliceRequest(CandidatePoolRequest):
     brand_include: list[str] = Field(default_factory=list)
     title_keywords: list[str] = Field(default_factory=list)
     material_keywords: list[str] = Field(default_factory=list)
+    price_min: Optional[float] = None
+    price_max: Optional[float] = None
     sort_by: str = "sales_window_sum"
     top_n: int = Field(default=3, ge=1, le=20)
 
@@ -114,6 +116,23 @@ class CandidatePoolSliceRequest(CandidatePoolRequest):
         if v is None:
             return []
         return [str(s).strip() for s in v if str(s).strip()]
+
+    @validator("price_min", "price_max", pre=True)
+    def _normalize_optional_price(cls, v: Any) -> Optional[float]:  # noqa: N805
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        value = float(v)
+        if value < 0:
+            raise ValueError("price_min and price_max must be non-negative")
+        return value
+
+    @root_validator(skip_on_failure=True)
+    def _validate_price_range(cls, values: dict[str, Any]) -> dict[str, Any]:  # noqa: N805
+        price_min = values.get("price_min")
+        price_max = values.get("price_max")
+        if price_min is not None and price_max is not None and price_min > price_max:
+            raise ValueError("price_min must be less than or equal to price_max")
+        return values
 
     @validator("sort_by")
     def _validate_sort_by(cls, v: str) -> str:  # noqa: N805
