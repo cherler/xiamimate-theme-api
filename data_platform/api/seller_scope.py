@@ -9,6 +9,17 @@ from typing import Iterable
 
 SELLER_SCOPE_POLICY_VERSION = "cross_border_sme_v1"
 
+_BLOCKED_CATEGORY_SEGMENTS: dict[str, tuple[str, ...]] = {
+    "security_surveillance_subcategory": (
+        "security surveillance",
+        "home security systems",
+        "surveillance systems",
+        "video surveillance",
+        "安防",
+        "监控",
+    ),
+}
+
 
 @dataclass(frozen=True)
 class SellerScopeDecision:
@@ -148,6 +159,23 @@ def _matches_term(text: str, term: str) -> bool:
     return re.search(rf"(?<![a-z0-9]){re.escape(normalized_term)}(?![a-z0-9])", text) is not None
 
 
+def _category_segment_reason(category_path: object | None = None, category_name: object | None = None) -> str | None:
+    scope_text = " ".join(
+        part
+        for part in (
+            _normalize_scope_text(category_path),
+            _normalize_scope_text(category_name),
+        )
+        if part
+    )
+    if not scope_text:
+        return None
+    for reason_code, segments in _BLOCKED_CATEGORY_SEGMENTS.items():
+        if any(_matches_term(scope_text, segment) for segment in segments):
+            return reason_code
+    return None
+
+
 def evaluate_seller_scope(
     *,
     category_path: object | None = None,
@@ -157,6 +185,14 @@ def evaluate_seller_scope(
     title: object | None = None,
 ) -> SellerScopeDecision:
     """Evaluate whether a category/query fits SME physical-goods cross-border selling."""
+    category_reason = _category_segment_reason(category_path=category_path, category_name=category_name)
+    if category_reason:
+        return SellerScopeDecision(
+            allowed=False,
+            reason_code=category_reason,
+            matched_terms=(str(category_path or category_name or "Security & Surveillance"),),
+        )
+
     texts = _iter_text_values(
         category_path=category_path,
         category_name=category_name,

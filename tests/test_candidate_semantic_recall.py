@@ -652,7 +652,7 @@ class CandidateSemanticRecallTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             OpportunityDiscoveryRequest(platform="TikTok")
 
-    def test_seller_scope_blocks_digital_media_categories(self) -> None:
+    def test_seller_scope_blocks_digital_media_and_security_surveillance_categories(self) -> None:
         service = ProductThemeService()
         rows = [
             {
@@ -666,6 +666,11 @@ class CandidateSemanticRecallTests(unittest.TestCase):
                 "category_name": "Movies",
             },
             {
+                "category_id": 22,
+                "category_path": "Electronics > Security & Surveillance > Home Security Systems",
+                "category_name": "Home Security Systems",
+            },
+            {
                 "category_id": 3,
                 "category_path": "Sports & Outdoors > Golf > Golf Balls",
                 "category_name": "Golf Balls",
@@ -675,18 +680,20 @@ class CandidateSemanticRecallTests(unittest.TestCase):
         kept, summary = service._filter_category_opportunity_rows_by_seller_scope(rows)
 
         self.assertEqual([row["category_id"] for row in kept], [3])
-        self.assertEqual(summary["filtered_count"], 2)
+        self.assertEqual(summary["filtered_count"], 3)
         self.assertEqual(summary["reason_counts"]["digital_or_licensed_goods"], 1)
         self.assertEqual(summary["reason_counts"]["copyright_media"], 1)
+        self.assertEqual(summary["reason_counts"]["security_surveillance_subcategory"], 1)
 
     def test_seller_scope_allows_physical_opportunity_categories(self) -> None:
         for category_path in [
             "Clothing, Shoes & Jewelry > Men > Shirts",
             "Sports & Outdoors > Golf > Golf Balls",
-            "Electronics > Headphones, Earbuds & Accessories > Earbud Headphones",
         ]:
             self.assertTrue(evaluate_seller_scope(category_path=category_path).allowed)
 
+        self.assertTrue(evaluate_seller_scope(category_path="Electronics > Headphones, Earbuds & Accessories > Earbud Headphones").allowed)
+        self.assertFalse(evaluate_seller_scope(category_path="Electronics > Security & Surveillance > Home Security Systems").allowed)
         self.assertFalse(evaluate_seller_scope(query="杀毒软件").allowed)
         self.assertFalse(evaluate_seller_scope(query="电影").allowed)
 
