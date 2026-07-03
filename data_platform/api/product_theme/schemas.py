@@ -359,14 +359,26 @@ class AsinHistoryTimeseriesRequest(BaseModel):
 class KeepaAsinLookupRequest(BaseModel):
     asins: list[str] = Field(..., min_length=1)
     marketplace: Union[str, int] = "US"
+    include_history: bool = False
+    window_days: int = Field(default=90, ge=7, le=90)
+    interval: str = Field(default="day")
+    metrics: list[str] = Field(default_factory=list)
 
-    @validator("asins", pre=True, always=True)
+    @validator("asins", "metrics", pre=True, always=True)
     def _accept_csv_string(cls, v: Any) -> list[str]:  # noqa: N805
         if isinstance(v, str):
             return [s.strip() for s in v.split(",") if s.strip()]
         if v is None:
             return []
         return v
+
+    @validator("interval")
+    def _validate_interval(cls, v: str) -> str:  # noqa: N805
+        allowed = {"day", "week"}
+        value = (v or "day").strip().lower()
+        if value not in allowed:
+            raise ValueError("interval must be one of: day, week")
+        return value
 
 
 class LaunchBudgetCalculatorRequest(BaseModel):

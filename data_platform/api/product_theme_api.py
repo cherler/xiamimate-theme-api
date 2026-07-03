@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import os
@@ -114,6 +114,7 @@ from data_platform.api.product_theme.schemas import (
 load_env_file_if_present(ROOT_ENV_FILE)
 QUERY_ASSISTANT = ProductRecallQueryAssistant(env_prefix="THEME_QUERY_NORMALIZER")
 LOGGER = logging.getLogger(__name__)
+_KEEPA_START_MINUTE = 21_564_000
 
 
 @dataclass
@@ -5719,6 +5720,8 @@ class ProductThemeService:
 
         is_yen = domain in {5}
         items: list[dict[str, Any]] = []
+        metrics = self._normalize_asin_history_metrics(request.metrics)
+        effective_window_days = min(request.window_days, 90)
 
         for product in products:
             csv = product.get("csv") or []
@@ -5764,7 +5767,7 @@ class ProductThemeService:
             bsr_avg_raw = _keepa_stats_value(stats_avg, 3)
             bsr_avg_window = round(float(bsr_avg_raw), 1) if bsr_avg_raw is not None else None
 
-            items.append({
+            item = {
                 "asin": product.get("asin"),
                 "product_title": product.get("title"),
                 "brand": product.get("brand"),
@@ -5783,20 +5786,182 @@ class ProductThemeService:
                 "review_growth_window": None,
                 "offer_count_avg_window": None,
                 "bsr_avg_window": bsr_avg_window,
-            })
+            }
+            if request.include_history:
+                history_rows = self._build_keepa_lookup_history_rows(
+                    product,
+                    domain=domain,
+                    is_yen=is_yen,
+                    window_days=effective_window_days,
+                    stats_window=stats_window,
+                    effective_price=effective_price,
+                    rating=rating,
+                    review_count=int(review_count) if review_count is not None else None,
+                    offer_count=offer_count if offer_count > 0 else None,
+                    bsr=int(bsr) if bsr is not None else None,
+                    estimated_daily_sales=est_daily_sales,
+                    category=category,
+                )
+                series_rows = self._group_asin_history_weekly(history_rows) if request.interval == "week" else history_rows
+                item["history_status"] = "keepa_history_ready" if history_rows else "keepa_history_empty"
+                item["history_source"] = "keepa_api"
+                item["history_window_days"] = effective_window_days
+                item["series"] = [self._build_asin_history_series_row(row, metrics, request.interval) for row in series_rows]
+                item["window_summary"] = self._build_asin_history_window_summary(
+                    history_rows,
+                    request.interval,
+                    effective_window_days,
+                )
+            items.append(item)
 
-        return {
+        notes = [
+            "数据直接来自 Keepa API 实时查询，非本地数据库缓存",
+            f"estimated_daily_sales 由 monthlySold / 30 估算",
+            f"当本地数据库查不到 ASIN 时可用此工具作为补充数据源",
+        ]
+        if request.include_history:
+            notes.append("include_history=true 时返回 Keepa 原始历史数组解析出的最近 90 天以内时序；该数据不写入本地数据库")
+        result = {
             "marketplace": marketplace,
             "domain": domain,
             "source": "keepa_api",
             "tokens_left": payload.get("tokensLeft"),
             "items": items,
-            "notes": [
-                "数据直接来自 Keepa API 实时查询，非本地数据库缓存",
-                f"estimated_daily_sales 由 monthlySold / 30 估算",
-                f"当本地数据库查不到 ASIN 时可用此工具作为补充数据源",
-            ],
+            "notes": notes,
         }
+        if request.include_history:
+            result.update(
+                {
+                    "include_history": True,
+                    "window_days": effective_window_days,
+                    "interval": request.interval,
+                    "metrics": metrics,
+                }
+            )
+        return result
+
+    def _build_keepa_lookup_history_rows(
+        self,
+        product: dict[str, Any],
+        *,
+        domain: int,
+        is_yen: bool,
+        window_days: int,
+        stats_window: int,
+        effective_price: float | None,
+        rating: float | None,
+        review_count: int | None,
+        offer_count: int | None,
+        bsr: int | None,
+        estimated_daily_sales: float | None,
+        category: str | None,
+    ) -> list[dict[str, Any]]:
+        csv = product.get("csv") or []
+        series_maps = {
+            "buy_box_price": self._parse_keepa_csv_history(csv, 18, is_price=True, is_yen=is_yen),
+            "amazon_price": self._parse_keepa_csv_history(csv, 0, is_price=True, is_yen=is_yen),
+            "new_price": self._parse_keepa_csv_history(csv, 1, is_price=True, is_yen=is_yen),
+            "bsr": self._parse_keepa_csv_history(csv, 3),
+            "rating": self._parse_keepa_csv_history(csv, 16, scale=10),
+            "review_count": self._parse_keepa_csv_history(csv, 17),
+            "new_offer_count": self._parse_keepa_csv_history(csv, 11),
+            "used_offer_count": self._parse_keepa_csv_history(csv, 12),
+            "monthly_sold": self._parse_keepa_pairs_history(product.get("monthlySoldHistory")),
+        }
+        all_dates = sorted({date for values in series_maps.values() for date in values.keys()})
+        if not all_dates:
+            return []
+        cutoff_date = max(all_dates) - timedelta(days=window_days - 1)
+        rows: list[dict[str, Any]] = []
+        for row_date in all_dates:
+            if row_date < cutoff_date:
+                continue
+            buy_box_price = series_maps["buy_box_price"].get(row_date)
+            amazon_price = series_maps["amazon_price"].get(row_date)
+            new_price = series_maps["new_price"].get(row_date)
+            monthly_sold = series_maps["monthly_sold"].get(row_date)
+            row_estimated_daily_sales = round(float(monthly_sold) / float(stats_window), 2) if monthly_sold else estimated_daily_sales
+            new_offer_count = series_maps["new_offer_count"].get(row_date)
+            used_offer_count = series_maps["used_offer_count"].get(row_date)
+            row_offer_count = None
+            if new_offer_count is not None or used_offer_count is not None:
+                row_offer_count = int(new_offer_count or 0) + int(used_offer_count or 0)
+            rows.append(
+                {
+                    "asin": product.get("asin"),
+                    "product_title": product.get("title"),
+                    "brand": product.get("brand"),
+                    "category": category,
+                    "category_path": self._keepa_category_path(product),
+                    "effective_price": buy_box_price or amazon_price or new_price or effective_price,
+                    "rating": series_maps["rating"].get(row_date, rating),
+                    "review_count": series_maps["review_count"].get(row_date, review_count),
+                    "offer_count": row_offer_count if row_offer_count is not None else offer_count,
+                    "bsr": series_maps["bsr"].get(row_date, bsr),
+                    "estimated_daily_sales": row_estimated_daily_sales,
+                    "date": row_date,
+                }
+            )
+        return rows
+
+    def _parse_keepa_csv_history(
+        self,
+        csv_2d: list,
+        index: int,
+        *,
+        is_price: bool = False,
+        is_yen: bool = False,
+        scale: int = 0,
+    ) -> dict[Any, float | int | None]:
+        if not csv_2d or index >= len(csv_2d):
+            return {}
+        return self._parse_keepa_pairs_history(csv_2d[index], is_price=is_price, is_yen=is_yen, scale=scale)
+
+    def _parse_keepa_pairs_history(
+        self,
+        values: list | None,
+        *,
+        is_price: bool = False,
+        is_yen: bool = False,
+        scale: int = 0,
+    ) -> dict[Any, float | int | None]:
+        result: dict[Any, float | int | None] = {}
+        if not values:
+            return result
+        idx = 0
+        while idx + 1 < len(values):
+            keepa_minute = values[idx]
+            raw_value = values[idx + 1]
+            idx += 2
+            row_date = self._keepa_minute_to_date(keepa_minute)
+            if row_date is None:
+                continue
+            if raw_value is None or raw_value == -1:
+                result[row_date] = None
+                continue
+            value = float(raw_value)
+            if is_price and not is_yen:
+                value = round(value / 100, 2)
+            elif is_price:
+                value = round(value, 2)
+            elif scale > 0:
+                value = round(value / scale, 2)
+            else:
+                value = int(value) if value == int(value) else value
+            result[row_date] = value
+        return result
+
+    def _keepa_minute_to_date(self, keepa_minute: Any):
+        try:
+            unix_ms = (int(keepa_minute) + _KEEPA_START_MINUTE) * 60_000
+            return datetime.fromtimestamp(unix_ms / 1000, tz=timezone.utc).date()
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
+
+    def _keepa_category_path(self, product: dict[str, Any]) -> str | None:
+        cat_tree = product.get("categoryTree") or []
+        names = [str(node.get("name") or "").strip() for node in cat_tree if isinstance(node, dict) and node.get("name")]
+        return " > ".join(names) if names else None
 
 
 service = ProductThemeService()

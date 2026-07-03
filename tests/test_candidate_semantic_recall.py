@@ -21,6 +21,7 @@ from data_platform.api.product_theme_api import (
     ProductForecastExplainRequest,
     ProductThemeService,
     ResolveCandidatesRequest,
+    KeepaAsinLookupRequest,
     _build_query_variants,
     _build_candidate_pool_quality,
     _candidate_field_matches_required_terms,
@@ -74,6 +75,93 @@ def score_for_query(query: str, record: CandidateRecord) -> tuple[float, list[st
 
 
 class CandidateSemanticRecallTests(unittest.TestCase):
+    def _fake_keepa_response(self):
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "tokensLeft": 100,
+                    "products": [
+                        {
+                            "asin": "B000000001",
+                            "title": "Test Product",
+                            "brand": "TestBrand",
+                            "productGroup": "Kitchen",
+                            "monthlySold": 300,
+                            "csv": [
+                                [7430830, 1999, 7432270, 1899],
+                                [7430830, 2099, 7432270, 1999],
+                                [],
+                                [7430830, 15000, 7432270, 12000],
+                                [],
+                                [],
+                                [],
+                                [],
+                                [],
+                                [],
+                                [],
+                                [7430830, 10, 7432270, 12],
+                                [7430830, 1, 7432270, 2],
+                                [],
+                                [],
+                                [],
+                                [7430830, 45, 7432270, 46],
+                                [7430830, 100, 7432270, 110],
+                                [7430830, 1999, 7432270, 1899],
+                            ],
+                            "categoryTree": [
+                                {"name": "Home & Kitchen"},
+                                {"name": "Kitchen & Dining"},
+                                {"name": "Kitchen"},
+                            ],
+                        }
+                    ],
+                }
+
+        return FakeResponse()
+
+    def test_keepa_lookup_default_keeps_snapshot_shape_without_history(self) -> None:
+        service = ProductThemeService()
+        with patch.dict(os.environ, {"KEEPA_API_KEY": "test-key"}), patch(
+            "data_platform.api.product_theme_api.http_requests.get",
+            return_value=self._fake_keepa_response(),
+        ):
+            result = service.keepa_asin_lookup(KeepaAsinLookupRequest(asins=["B000000001"], marketplace="US"))
+
+        item = result["items"][0]
+        self.assertNotIn("include_history", result)
+        self.assertNotIn("series", item)
+        self.assertEqual(item["effective_price"], 18.99)
+        self.assertEqual(item["review_count"], 110)
+
+    def test_keepa_lookup_explicit_history_returns_series(self) -> None:
+        service = ProductThemeService()
+        with patch.dict(os.environ, {"KEEPA_API_KEY": "test-key"}), patch(
+            "data_platform.api.product_theme_api.http_requests.get",
+            return_value=self._fake_keepa_response(),
+        ):
+            result = service.keepa_asin_lookup(
+                KeepaAsinLookupRequest(
+                    asins=["B000000001"],
+                    marketplace="US",
+                    include_history=True,
+                    window_days=90,
+                    metrics=["effective_price", "review_count", "bsr", "offer_count"],
+                )
+            )
+
+        item = result["items"][0]
+        self.assertTrue(result["include_history"])
+        self.assertEqual(item["history_status"], "keepa_history_ready")
+        self.assertEqual(item["history_window_days"], 90)
+        self.assertEqual(len(item["series"]), 2)
+        self.assertEqual(item["series"][-1]["effective_price"], 18.99)
+        self.assertEqual(item["series"][-1]["review_count"], 110)
+        self.assertEqual(item["series"][-1]["offer_count"], 14)
+        self.assertEqual(item["window_summary"]["review_growth_window"], 10)
+
     def test_multi_token_query_requires_product_core_term(self) -> None:
         fan = make_record(
             title="Portable rechargeable desk fan",
